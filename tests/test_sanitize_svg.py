@@ -241,3 +241,35 @@ def test_valid_https_href_preserved():
     dirty = '<a href="https://example.com/flame">stack</a>'
     result = _sanitize_svg(dirty)
     assert 'https://example.com/flame' in result
+
+
+# ── N3 (round 5): style=url() bypass ─────────────────────────────────────────
+
+
+def test_style_url_javascript_stripped():
+    """style=url(javascript:) is neutralized (N3 round 5)."""
+    dirty = '<rect style="fill:url(javascript:alert(1))" />'
+    result = _sanitize_svg(dirty)
+    assert 'javascript:' not in result
+
+
+def test_style_url_data_stripped():
+    """style=url(data:...) is neutralized (N3 round 5)."""
+    dirty = '<rect style="fill:url(data:text/html,<script>evil()</script>)" />'
+    result = _sanitize_svg(dirty)
+    assert 'data:' not in result
+
+
+def test_style_url_anchor_preserved():
+    """style=url(#anchor) is preserved — legitimate SVG pattern (N3 round 5)."""
+    clean = '<rect style="fill:url(#myGradient)" />'
+    result = _sanitize_svg(clean)
+    assert 'url(#myGradient)' in result
+
+
+def test_style_non_url_preserved():
+    """style attributes without url() are not modified (N3 round 5)."""
+    clean = '<text style="font-size:12px;fill:#333">ok</text>'
+    result = _sanitize_svg(clean)
+    assert 'font-size:12px' in result
+    assert 'fill:#333' in result

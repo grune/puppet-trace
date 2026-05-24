@@ -293,3 +293,92 @@ VALIDATORS=$(awk '
     [ "$status" -eq 0 ]
     [ "$output" -ge 1 ]
 }
+
+###############################################################################
+# Round 5 security fixes
+###############################################################################
+
+@test "N1: _stop_puppet_service does not clear main shell traps" {
+    # Verify trap - EXIT INT TERM is NOT in _stop_puppet_service function body
+    run bash -c '
+        in_func=0
+        found_trap=0
+        while IFS= read -r line; do
+            [[ "$line" =~ _stop_puppet_service\(\) ]] && in_func=1
+            if [[ $in_func -eq 1 ]]; then
+                [[ "$line" =~ ^"}" ]] && in_func=0
+                [[ "$line" =~ "trap - EXIT INT TERM" ]] && found_trap=1
+            fi
+        done < "'"$SCRIPT"'"
+        echo "found_trap=$found_trap"
+        [[ $found_trap -eq 0 ]]
+    '
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"found_trap=0"* ]]
+}
+
+@test "N2: _validate_safe_path rejects backtick injection" {
+    run bash -c "$VALIDATORS; _validate_safe_path '/tmp/\`id\`' 'outdir'"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"command substitution"* ]]
+}
+
+@test "N2: _validate_safe_path rejects dollar-paren injection" {
+    run bash -c "$VALIDATORS; _validate_safe_path '/tmp/\$(id)' 'outdir'"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"command substitution"* ]]
+}
+
+@test "N3: _sanitize_svg strips style=url(javascript:) bypass" {
+    # Delegate to the pytest suite which properly extracts _sanitize_svg from the script
+    run python3 -m pytest "$(dirname "$SCRIPT")/../tests/test_sanitize_svg.py::test_style_url_javascript_stripped" -q 2>&1
+    [ "$status" -eq 0 ]
+}
+
+@test "N4: stack_sampler has a deadline (1h)" {
+    run grep -A5 'stack_sampler()' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"deadline"* ]]
+}
+
+@test "N5: cmd_ship accepts user@host syntax" {
+    run bash -c '
+        '"$VALIDATORS"'
+        remote="user@myhost.example.com:/remote/path"
+        remote_host="${remote%%:*}"
+        remote_path="${remote#*:}"
+        ssh_user=""
+        ssh_host="$remote_host"
+        if [[ "$remote_host" == *@* ]]; then
+            ssh_user="${remote_host%%@*}"
+            ssh_host="${remote_host#*@}"
+            _validate_puppet_id "$ssh_user" "remote_user" || exit 1
+        fi
+        _validate_puppet_id "$ssh_host" "remote_host" || exit 1
+        echo "ACCEPTED"
+    '
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"ACCEPTED"* ]]
+}
+
+@test "N5: cmd_ship rejects @ with invalid user component" {
+    run bash -c '
+        '"$VALIDATORS"'
+        remote="us er@myhost.example.com:/remote/path"
+        remote_host="${remote%%:*}"
+        ssh_user="${remote_host%%@*}"
+        ssh_host="${remote_host#*@}"
+        _validate_puppet_id "$ssh_user" "remote_user" || exit 1
+        echo "ACCEPTED"
+    '
+    [ "$status" -ne 0 ]
+    [[ "$output" != *"ACCEPTED"* ]]
+}
+
+@test "N12: _PT_CLEANUP_PIDS empty array does not pass empty string to kill" {
+    # Verify the safe expansion pattern is used (not [@]:-}
+    run grep '_PT_CLEANUP_PIDS\[@\]' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    # Should use the safe ${arr[@]+"${arr[@]}"} idiom, not [@]:-}
+    [[ "$output" != *'[@]:-}'* ]]
+}

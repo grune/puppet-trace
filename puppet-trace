@@ -34,6 +34,11 @@ _validate_safe_path() {
         echo "[puppet-trace] ERROR: $name contains unsafe characters (quotes/newlines): '$val'" >&2
         return 1
     fi
+    # Block shell command substitution characters
+    if [[ "$val" == *'`'* ]] || [[ "$val" == *'$('* ]] || [[ "$val" == *'${'* ]]; then
+        echo "[puppet-trace] ERROR: $name contains command substitution characters: '$val'" >&2
+        return 1
+    fi
     # Block path traversal
     if [[ "$val" == *"/../"* ]] || [[ "$val" == *"/.."  ]] || [[ "$val" == "../"* ]]; then
         echo "[puppet-trace] ERROR: $name contains path traversal: '$val'" >&2
@@ -45,7 +50,8 @@ _validate_safe_path() {
 _PT_CLEANUP_PIDS=()
 _pt_cleanup() {
     local sig="${1:-EXIT}"
-    for pid in "${_PT_CLEANUP_PIDS[@]:-}"; do
+    local pid
+    for pid in "${_PT_CLEANUP_PIDS[@]+"${_PT_CLEANUP_PIDS[@]}"}"; do
         kill "$pid" 2>/dev/null || true
     done
     # Restart puppet service if we stopped it
@@ -85,19 +91,25 @@ cmd_enable() {
     if [[ ! -f "$PUPPET_CONF" ]]; then
         echo "[puppet-trace] WARNING: $PUPPET_CONF not found — cannot install postrun_command" >&2
     else
-        # Remove any existing puppet-trace postrun line first (idempotent)
-        sed -i "/postrun_command\s*=\s*\/usr\/local\/bin\/puppet-trace collect/d" "$PUPPET_CONF"
-
-        # Check if [agent] section exists
+        [[ -L "$PUPPET_CONF" ]] && echo "[puppet-trace] NOTE: $PUPPET_CONF is a symlink — editing the symlink target in place" >&2
+        local _pt_conf_tmp
+        _pt_conf_tmp=$(mktemp)
+        # Remove any existing puppet-trace postrun line first (idempotent), then insert under first [agent] only
         if grep -q '^\[agent\]' "$PUPPET_CONF"; then
-            # Insert postrun_command after [agent]
-            sed -i '/^\[agent\]/a\    postrun_command = /usr/local/bin/puppet-trace collect' "$PUPPET_CONF"
+            awk '
+                /postrun_command[[:space:]]*=[[:space:]]*\/usr\/local\/bin\/puppet-trace collect/ { next }
+                /^\[agent\]/ && !inserted { print; print "    postrun_command = /usr/local/bin/puppet-trace collect"; inserted=1; next }
+                { print }
+            ' "$PUPPET_CONF" > "$_pt_conf_tmp"
+            cat "$_pt_conf_tmp" > "$PUPPET_CONF"
             echo "[puppet-trace] postrun_command inserted under [agent] in $PUPPET_CONF"
         else
-            # Append [agent] section
+            grep -v 'postrun_command[[:space:]]*=[[:space:]]*\/usr\/local\/bin\/puppet-trace collect' "$PUPPET_CONF" > "$_pt_conf_tmp"
+            cat "$_pt_conf_tmp" > "$PUPPET_CONF"
             printf '\n[agent]\n    postrun_command = /usr/local/bin/puppet-trace collect\n' >> "$PUPPET_CONF"
             echo "[puppet-trace] [agent] section added to $PUPPET_CONF with postrun_command"
         fi
+        rm -f "$_pt_conf_tmp"
     fi
 
     echo "[puppet-trace] enabled — next daemon puppet run will call: $POSTRUN_CMD"
@@ -117,7 +129,11 @@ cmd_disable() {
     echo "[puppet-trace] flag file removed"
 
     if [[ -f "$PUPPET_CONF" ]]; then
-        sed -i "/postrun_command\s*=\s*\/usr\/local\/bin\/puppet-trace collect/d" "$PUPPET_CONF"
+        local _pt_conf_tmp
+        _pt_conf_tmp=$(mktemp)
+        grep -v 'postrun_command[[:space:]]*=[[:space:]]*\/usr\/local\/bin\/puppet-trace collect' "$PUPPET_CONF" > "$_pt_conf_tmp" || true
+        cat "$_pt_conf_tmp" > "$PUPPET_CONF"
+        rm -f "$_pt_conf_tmp"
         echo "[puppet-trace] postrun_command removed from $PUPPET_CONF"
     fi
 
@@ -406,7 +422,7 @@ _generate_profile_flamegraph() {
         tool_dir=$(dirname "$tool_path")
         if [[ -w "$tool_dir" ]] && [[ ! "$tool_dir" == /opt/* ]] && [[ ! "$tool_dir" == /usr/* ]]; then
             echo "[puppet-trace] WARNING: $tool_name resolved to writable dir '$tool_dir' — disabling" >&2
-            eval "$tool_name=''"
+            printf -v "$tool_name" ''
             return 1
         fi
     }
@@ -606,6 +622,13 @@ def _sanitize_svg(s):
                 s, flags=_re.IGNORECASE)
     # Remove on* event handlers (quoted, single-quoted, and unquoted values)
     s = _re.sub(r'\bon\w+\s*=\s*(?:"[^"]*"|\'[^\']*\'|\S+)', '', s, flags=_re.IGNORECASE)
+    # Strip url(non-anchor) from style= attributes to block style="fill:url(javascript:...)"
+    def _clean_style_url(m):
+        return _re.sub(r'url\s*\(([^)]*)\)',
+                       lambda u: u.group(0) if u.group(1).strip().startswith('#') else 'url(#)',
+                       m.group(0), flags=_re.IGNORECASE)
+    s = _re.sub(r'style\s*=\s*"[^"]*"', _clean_style_url, s, flags=_re.IGNORECASE)
+    s = _re.sub(r"style\s*=\s*'[^']*'", _clean_style_url, s, flags=_re.IGNORECASE)
     return s
 
 if os.path.isfile(profile_flamegraph_svg) and os.path.getsize(profile_flamegraph_svg) > 0:
@@ -1304,7 +1327,8 @@ stack_sampler() {
     trap - EXIT INT TERM
     local pid=$1
     local outfile=$2
-    while kill -0 "$pid" 2>/dev/null; do
+    local deadline=$(( $(date +%s) + 3600 ))  # max 1 hour
+    while kill -0 "$pid" 2>/dev/null && [[ $(date +%s) -lt $deadline ]]; do
         if [[ -r /proc/$pid/stack ]]; then
             echo "---" >>"$outfile"
             cat /proc/$pid/stack 2>/dev/null >>"$outfile" || true
@@ -1324,7 +1348,6 @@ IO_CORR_JSON="$OUTDIR/io-correlation.json"
 
 _PUPPET_SVC_STOPPED=false
 _stop_puppet_service() {
-    trap - EXIT INT TERM
     local lock="/opt/puppetlabs/puppet/cache/state/agent_catalog_run.lock"
     if [[ -f "$lock" ]]; then
         echo "[puppet-trace] lock file exists — stopping puppet.service to clear it..."
@@ -1631,15 +1654,15 @@ enrich_from_puppetdb() {
 
     local rr_json="$OUTDIR/resource-report.json"
     local res_count
-    res_count=$(python3 -c "import json; d=json.load(open('$rr_json')); print(len(d.get('resources',[])))" 2>/dev/null || echo 0)
+    res_count=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(len(d.get('resources',[])))" "$rr_json" 2>/dev/null || echo 0)
     if [[ "$res_count" -gt 0 ]]; then
         echo "[puppet-trace] resource-report has $res_count resources — skipping PuppetDB enrichment"
         return
     fi
 
     local transaction_uuid certname puppet_server ssh_user ssh_key _ssh_opts
-    transaction_uuid=$(python3 -c "import json; print(json.load(open('$rr_json')).get('transaction_uuid',''))" 2>/dev/null || echo "")
-    certname=$(python3 -c "import json; print(json.load(open('$rr_json')).get('certname',''))" 2>/dev/null || echo "")
+    transaction_uuid=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('transaction_uuid',''))" "$rr_json" 2>/dev/null || echo "")
+    certname=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('certname',''))" "$rr_json" 2>/dev/null || echo "")
     # Fallback: read host: from last_run_report.yaml directly (more reliable than hostname -f)
     if [[ -z "$certname" ]]; then
         certname=$(grep -m1 '^host:' "$LAST_RUN_REPORT" 2>/dev/null | awk '{print $2}' | tr -d "'" || true)
@@ -2669,6 +2692,13 @@ def _sanitize_svg(s):
                 s, flags=_re.IGNORECASE)
     # Remove on* event handlers (quoted, single-quoted, and unquoted values)
     s = _re.sub(r'\bon\w+\s*=\s*(?:"[^"]*"|\'[^\']*\'|\S+)', '', s, flags=_re.IGNORECASE)
+    # Strip url(non-anchor) from style= attributes to block style="fill:url(javascript:...)"
+    def _clean_style_url(m):
+        return _re.sub(r'url\s*\(([^)]*)\)',
+                       lambda u: u.group(0) if u.group(1).strip().startswith('#') else 'url(#)',
+                       m.group(0), flags=_re.IGNORECASE)
+    s = _re.sub(r'style\s*=\s*"[^"]*"', _clean_style_url, s, flags=_re.IGNORECASE)
+    s = _re.sub(r"style\s*=\s*'[^']*'", _clean_style_url, s, flags=_re.IGNORECASE)
     return s
 
 flamegraph_section = ''
@@ -3117,12 +3147,12 @@ cmd_report() {
     WALL_SECONDS=0; PUPPET_EXIT=0; PUPPET_CMD_META="puppet agent --test"
     IDEMPOTENCY_PASS=unknown; IDEMPOTENCY_CHANGES=0; RUN_START_ISO=""
     if [[ -f "$meta" ]]; then
-        WALL_SECONDS=$(python3 -c "import json; d=json.load(open('$meta')); print(int(d.get('wall_seconds',0)))" 2>/dev/null || echo 0)
-        PUPPET_EXIT=$(python3 -c "import json; d=json.load(open('$meta')); print(int(d.get('puppet_exit',0)))" 2>/dev/null || echo 0)
-        PUPPET_CMD_META=$(python3 -c "import json; d=json.load(open('$meta')); print(d.get('puppet_cmd','puppet agent --test'))" 2>/dev/null || echo "puppet agent --test")
-        IDEMPOTENCY_PASS=$(python3 -c "import json; d=json.load(open('$meta')); print(d.get('idempotency_pass','unknown'))" 2>/dev/null || echo "unknown")
-        IDEMPOTENCY_CHANGES=$(python3 -c "import json; d=json.load(open('$meta')); print(int(d.get('idempotency_changes',0)))" 2>/dev/null || echo 0)
-        RUN_START_ISO=$(python3 -c "import json; d=json.load(open('$meta')); print(d.get('run_start_iso',''))" 2>/dev/null || echo "")
+        WALL_SECONDS=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(int(d.get('wall_seconds',0)))" "$meta" 2>/dev/null || echo 0)
+        PUPPET_EXIT=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(int(d.get('puppet_exit',0)))" "$meta" 2>/dev/null || echo 0)
+        PUPPET_CMD_META=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('puppet_cmd','puppet agent --test'))" "$meta" 2>/dev/null || echo "puppet agent --test")
+        IDEMPOTENCY_PASS=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('idempotency_pass','unknown'))" "$meta" 2>/dev/null || echo "unknown")
+        IDEMPOTENCY_CHANGES=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(int(d.get('idempotency_changes',0)))" "$meta" 2>/dev/null || echo 0)
+        RUN_START_ISO=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('run_start_iso',''))" "$meta" 2>/dev/null || echo "")
     else
         echo "[puppet-trace report] WARNING: run-meta.json not found in $outdir — using defaults" >&2
     fi
@@ -3202,7 +3232,14 @@ cmd_ship() {
     local remote_host="${remote%%:*}"
     local remote_path="${remote#*:}"
     [[ "$remote_path" == "$remote_host" ]] && { echo "ship: remote must be [user@]host:path" >&2; exit 1; }
-    _validate_puppet_id "$remote_host" "remote_host" || exit 1
+    # Allow user@host format: validate each component separately
+    local ssh_user="" ssh_host="$remote_host"
+    if [[ "$remote_host" == *@* ]]; then
+        ssh_user="${remote_host%%@*}"
+        ssh_host="${remote_host#*@}"
+        _validate_puppet_id "$ssh_user" "remote_user" || exit 1
+    fi
+    _validate_puppet_id "$ssh_host" "remote_host" || exit 1
     _validate_safe_path "$remote_path" "remote path" || exit 1
 
     local exclude_args=(--exclude='strace.raw' --exclude='perf.data')
@@ -3211,7 +3248,7 @@ cmd_ship() {
     echo "[puppet-trace ship] $outdir → $remote (${exclude_args[*]:-no exclusions})"
     rsync -av --progress "${exclude_args[@]}" "${rsync_extra[@]}" "$outdir/" "${remote}/"
     echo "[puppet-trace ship] synced — running report on $remote_host..."
-    ssh "$remote_host" puppet-trace report -- "$remote_path"
+    ssh -o BatchMode=yes -o ConnectTimeout=30 -o StrictHostKeyChecking=yes "$remote_host" puppet-trace report -- "$remote_path"
     echo "[puppet-trace ship] done — report at $remote_host:${remote_path}/report.html"
 }
 
@@ -3267,30 +3304,30 @@ RESOURCES_IN_TABLE=0
 TOP_WRITER=""
 if [[ -f "$IO_CORR_JSON" ]]; then
     STRACE_EVENTS=$(python3 -c "
-import json
-data=json.load(open('$IO_CORR_JSON'))
+import json,sys
+data=json.load(open(sys.argv[1]))
 print(sum(r.get('strace_events',0) for r in data))
-" 2>/dev/null || echo 0)
+" "$IO_CORR_JSON" 2>/dev/null || echo 0)
     RESOURCES_IN_TABLE=$(python3 -c "
-import json
-data=json.load(open('$IO_CORR_JSON'))
+import json,sys
+data=json.load(open(sys.argv[1]))
 print(len(data))
-" 2>/dev/null || echo 0)
+" "$IO_CORR_JSON" 2>/dev/null || echo 0)
     TOP_WRITER=$(python3 -c "
-import json
-data=json.load(open('$IO_CORR_JSON'))
+import json,sys
+data=json.load(open(sys.argv[1]))
 if data:
     top=data[0]
     b=top.get('disk_bytes_written',0)
     mb=b/1048576
     print(f\"{top['title']} wrote {mb:.1f}MB\")
-" 2>/dev/null || echo "n/a")
+" "$IO_CORR_JSON" 2>/dev/null || echo "n/a")
 elif [[ -f "$OUTDIR/resource-report.json" ]]; then
     RESOURCES_IN_TABLE=$(python3 -c "
-import json
-data=json.load(open('$OUTDIR/resource-report.json'))
+import json,sys
+data=json.load(open(sys.argv[1]))
 print(len(data.get('resources',[])))
-" 2>/dev/null || echo 0)
+" "$OUTDIR/resource-report.json" 2>/dev/null || echo 0)
 fi
 
 PROFILE_AVAILABLE=no
