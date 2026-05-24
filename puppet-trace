@@ -16,6 +16,10 @@
 
 set -euo pipefail
 
+# Initialize late-dispatch variables early so environment injection is overwritten
+_LATE_SUBCMD=""
+_LATE_ARGS=()
+
 _validate_puppet_id() {
     local val="$1" name="$2"
     if [[ ! "$val" =~ ^[a-zA-Z0-9._:-]+$ ]]; then
@@ -394,6 +398,21 @@ _generate_profile_flamegraph() {
     command -v flamegraph.pl &>/dev/null \
         && flamegraph_pl=$(command -v flamegraph.pl)
 
+    # Reject tools resolved from world-writable directories
+    _validate_tool_path() {
+        local tool_path="$1" tool_name="$2"
+        [[ -z "$tool_path" ]] && return 0  # absent is fine, feature disabled
+        local tool_dir
+        tool_dir=$(dirname "$tool_path")
+        if [[ -w "$tool_dir" ]] && [[ ! "$tool_dir" == /opt/* ]] && [[ ! "$tool_dir" == /usr/* ]]; then
+            echo "[puppet-trace] WARNING: $tool_name resolved to writable dir '$tool_dir' — disabling" >&2
+            eval "$tool_name=''"
+            return 1
+        fi
+    }
+    _validate_tool_path "$flamegraph_pl" flamegraph_pl
+    _validate_tool_path "$parser" parser
+
     if [[ ! -x "$parser" ]] || [[ ! -x "$flamegraph_pl" ]]; then
         echo "[puppet-trace] puppet-profile-parser or flamegraph.pl not found — skipping" >&2
         return 1
@@ -570,11 +589,21 @@ def _sanitize_svg(s):
     # Remove animate/set elements that can animate href to javascript: URIs
     s = _re.sub(r'<(?:animate|set)\b[^>]*/?\s*>', '', s, flags=_re.IGNORECASE)
     s = _re.sub(r'<(?:animate|set)\b.*?</(?:animate|set)>', '', s, flags=_re.DOTALL|_re.IGNORECASE)
-    # Neutralize javascript: URIs in href attributes (quoted and unquoted)
-    s = _re.sub(r'((?:xlink:)?href\s*=\s*["\']?)javascript:', r'\1#', s, flags=_re.IGNORECASE)
-    # Neutralize data: URIs in href/src (quoted and unquoted)
-    s = _re.sub(r'((?:xlink:)?href\s*=\s*["\']?)data:', r'\1#', s, flags=_re.IGNORECASE)
-    s = _re.sub(r'(src\s*=\s*["\']?)data:', r'\1#', s, flags=_re.IGNORECASE)
+    # Allowlist href attributes: only allow #anchors and http(s):// URLs
+    # Catches javascript:, vbscript:, data:, entity-encoded schemes, tab-split, etc.
+    def _clean_href(m):
+        prefix, val = m.group(1), m.group(2).strip('"\'').strip()
+        # Decode common HTML entities before checking scheme
+        val_decoded = val.replace('&#115;','s').replace('&#106;','j').replace('&#97;','a')
+        val_decoded = val_decoded.replace('\t','').replace('\n','').replace('\r','')
+        if _re.match(r'^https?://', val_decoded, _re.IGNORECASE) or val_decoded.startswith('#'):
+            return m.group(0)
+        return prefix + '"#"'
+    s = _re.sub(r'((?:xlink:)?href\s*=\s*)("[^"]*"|\'[^\']*\'|[^\s>]+)', _clean_href, s, flags=_re.IGNORECASE)
+    # Also neutralize src= — only allow https:// URLs
+    s = _re.sub(r'(src\s*=\s*)("[^"]*"|\'[^\']*\'|[^\s>]+)',
+                lambda m: m.group(0) if _re.match(r'["\']?https?://', m.group(2), _re.IGNORECASE) else m.group(1) + '"#"',
+                s, flags=_re.IGNORECASE)
     # Remove on* event handlers (quoted, single-quoted, and unquoted values)
     s = _re.sub(r'\bon\w+\s*=\s*(?:"[^"]*"|\'[^\']*\'|\S+)', '', s, flags=_re.IGNORECASE)
     return s
@@ -1220,6 +1249,7 @@ FIXPY2
 # POLLING WORKERS
 ###############################################################################
 proc_poller() {
+    trap - EXIT INT TERM
     local pid=$1
     local outfile=$2
     local elapsed=0
@@ -1252,6 +1282,7 @@ proc_poller() {
 }
 
 net_poller() {
+    trap - EXIT INT TERM
     local pid=$1
     local outfile=$2
     # Use end-time sentinel instead of pure PID liveness to avoid PID-reuse confusion
@@ -1270,6 +1301,7 @@ net_poller() {
 }
 
 stack_sampler() {
+    trap - EXIT INT TERM
     local pid=$1
     local outfile=$2
     while kill -0 "$pid" 2>/dev/null; do
@@ -1292,6 +1324,7 @@ IO_CORR_JSON="$OUTDIR/io-correlation.json"
 
 _PUPPET_SVC_STOPPED=false
 _stop_puppet_service() {
+    trap - EXIT INT TERM
     local lock="/opt/puppetlabs/puppet/cache/state/agent_catalog_run.lock"
     if [[ -f "$lock" ]]; then
         echo "[puppet-trace] lock file exists — stopping puppet.service to clear it..."
@@ -1374,6 +1407,7 @@ run_puppet() {
     # /proc/PID/io poller for per-resource delta tracking
     IO_POLL_LOG="$OUTDIR/proc-io-poll.log"
     {
+        trap - EXIT INT TERM
         local io_deadline=$(( $(date +%s) + 3600 ))
         while kill -0 "$PUPPET_PID" 2>/dev/null && [[ $(date +%s) -lt $io_deadline ]]; do
             local ts rb wb
@@ -1410,12 +1444,14 @@ run_puppet() {
     fi
 
     (
+        trap - EXIT INT TERM
         sleep 10
         pmap -x "$PUPPET_PID" >"$PMAP_MID" 2>/dev/null || echo "(pmap unavailable)" >"$PMAP_MID"
     ) &
 
-    wait "$PUPPET_PID" || true
-    PUPPET_EXIT=${PIPESTATUS[0]:-$?}
+    wait "$PUPPET_PID"
+    PUPPET_EXIT=$?
+    true
     RUN_END_TS=$(date +%s)
     WALL_SECONDS=$(( RUN_END_TS - RUN_START_TS ))
 
@@ -1656,12 +1692,21 @@ enrich_from_puppetdb() {
         fi
     fi
 
-    python3 - "$rr_json" "$pdb_json" "${event_json:-[]}" <<'PYEOF_PDB'
-import json, sys
+    local _pdb_tmp _evt_tmp
+    _pdb_tmp=$(mktemp "${OUTDIR}/puppet-trace-tmp.XXXXX.json")
+    _evt_tmp=$(mktemp "${OUTDIR}/puppet-trace-tmp.XXXXX.json")
+    echo "$pdb_json" > "$_pdb_tmp"
+    echo "${event_json:-[]}" > "$_evt_tmp"
+
+    python3 - "$rr_json" "$_pdb_tmp" "$_evt_tmp" <<'PYEOF_PDB'
+import json, sys, os
 
 rr_path    = sys.argv[1]
-pdb_res    = json.loads(sys.argv[2]) if len(sys.argv) > 2 else []
-pdb_events = json.loads(sys.argv[3]) if len(sys.argv) > 3 else []
+pdb_path   = sys.argv[2] if len(sys.argv) > 2 else ''
+evt_path   = sys.argv[3] if len(sys.argv) > 3 else ''
+
+pdb_res    = json.load(open(pdb_path)) if pdb_path and os.path.isfile(pdb_path) else []
+pdb_events = json.load(open(evt_path)) if evt_path and os.path.isfile(evt_path) else []
 
 rr = json.load(open(rr_path))
 
@@ -1708,6 +1753,7 @@ with open(rr_path, 'w') as f:
     json.dump(rr, f, indent=2)
 print(f"[puppet-trace] PuppetDB enrichment: {len(resources)} resources", file=sys.stderr)
 PYEOF_PDB
+    rm -f "$_pdb_tmp" "$_evt_tmp"
 }
 
 ###############################################################################
@@ -2606,11 +2652,21 @@ def _sanitize_svg(s):
     # Remove animate/set elements that can animate href to javascript: URIs
     s = _re.sub(r'<(?:animate|set)\b[^>]*/?\s*>', '', s, flags=_re.IGNORECASE)
     s = _re.sub(r'<(?:animate|set)\b.*?</(?:animate|set)>', '', s, flags=_re.DOTALL|_re.IGNORECASE)
-    # Neutralize javascript: URIs in href attributes (quoted and unquoted)
-    s = _re.sub(r'((?:xlink:)?href\s*=\s*["\']?)javascript:', r'\1#', s, flags=_re.IGNORECASE)
-    # Neutralize data: URIs in href/src (quoted and unquoted)
-    s = _re.sub(r'((?:xlink:)?href\s*=\s*["\']?)data:', r'\1#', s, flags=_re.IGNORECASE)
-    s = _re.sub(r'(src\s*=\s*["\']?)data:', r'\1#', s, flags=_re.IGNORECASE)
+    # Allowlist href attributes: only allow #anchors and http(s):// URLs
+    # Catches javascript:, vbscript:, data:, entity-encoded schemes, tab-split, etc.
+    def _clean_href(m):
+        prefix, val = m.group(1), m.group(2).strip('"\'').strip()
+        # Decode common HTML entities before checking scheme
+        val_decoded = val.replace('&#115;','s').replace('&#106;','j').replace('&#97;','a')
+        val_decoded = val_decoded.replace('\t','').replace('\n','').replace('\r','')
+        if _re.match(r'^https?://', val_decoded, _re.IGNORECASE) or val_decoded.startswith('#'):
+            return m.group(0)
+        return prefix + '"#"'
+    s = _re.sub(r'((?:xlink:)?href\s*=\s*)("[^"]*"|\'[^\']*\'|[^\s>]+)', _clean_href, s, flags=_re.IGNORECASE)
+    # Also neutralize src= — only allow https:// URLs
+    s = _re.sub(r'(src\s*=\s*)("[^"]*"|\'[^\']*\'|[^\s>]+)',
+                lambda m: m.group(0) if _re.match(r'["\']?https?://', m.group(2), _re.IGNORECASE) else m.group(1) + '"#"',
+                s, flags=_re.IGNORECASE)
     # Remove on* event handlers (quoted, single-quoted, and unquoted values)
     s = _re.sub(r'\bon\w+\s*=\s*(?:"[^"]*"|\'[^\']*\'|\S+)', '', s, flags=_re.IGNORECASE)
     return s
@@ -3146,6 +3202,7 @@ cmd_ship() {
     local remote_host="${remote%%:*}"
     local remote_path="${remote#*:}"
     [[ "$remote_path" == "$remote_host" ]] && { echo "ship: remote must be [user@]host:path" >&2; exit 1; }
+    _validate_puppet_id "$remote_host" "remote_host" || exit 1
     _validate_safe_path "$remote_path" "remote path" || exit 1
 
     local exclude_args=(--exclude='strace.raw' --exclude='perf.data')

@@ -206,3 +206,38 @@ def test_set_element_stripped():
     dirty = '<set attributeName="href" to="javascript:alert(1)"/>'
     result = _sanitize_svg(dirty)
     assert 'set attributeName' not in result
+
+
+# ── N1: allowlist-based href tests ───────────────────────────────────────────
+
+
+def test_entity_encoded_javascript_neutralized():
+    """HTML entity-encoded javascript: scheme in href is neutralized (N1)."""
+    dirty = '<a href="java&#115;cript:alert(1)">x</a>'
+    result = _sanitize_svg(dirty)
+    # href must not contain the dangerous URI — should be replaced with #
+    assert 'java&#115;cript:' not in result
+    assert 'href="#"' in result or "href='#'" in result
+
+
+def test_vbscript_neutralized():
+    """vbscript: href is neutralized by the allowlist approach (N1)."""
+    dirty = '<a href="vbscript:msgbox(1)">x</a>'
+    result = _sanitize_svg(dirty)
+    assert 'vbscript:' not in result.lower()
+    assert 'href="#"' in result or "href='#'" in result
+
+
+def test_tab_split_javascript_neutralized():
+    """Tab-split javascript: URI in href is neutralized (N1)."""
+    dirty = '<a href="java\tscript:alert(1)">x</a>'
+    result = _sanitize_svg(dirty)
+    assert 'javascript:' not in result.lower()
+    assert 'href="#"' in result or "href='#'" in result
+
+
+def test_valid_https_href_preserved():
+    """A valid https:// href is preserved by the allowlist (N1)."""
+    dirty = '<a href="https://example.com/flame">stack</a>'
+    result = _sanitize_svg(dirty)
+    assert 'https://example.com/flame' in result
