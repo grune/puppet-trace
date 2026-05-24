@@ -14,6 +14,11 @@
 # Usage: sudo puppet-trace once [args]
 #        sudo puppet-trace enable / disable
 
+# Allow root to run puppet agent as the puppet service user (H1 mitigation)
+# Required when puppet-trace is invoked as root (sudo puppet-trace once)
+root ALL=(puppet) NOPASSWD: /opt/puppetlabs/bin/puppet agent --test *
+root ALL=(puppet) NOPASSWD: /opt/puppetlabs/bin/puppet agent --test --noop *
+
 Defaults:%puppet-trace-ops !requiretty
 
 # strace: wrap puppet process — output must land in log dir

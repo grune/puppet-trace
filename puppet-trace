@@ -24,6 +24,14 @@ _validate_puppet_id() {
     fi
 }
 
+_validate_safe_path() {
+    local val="$1" name="${2:-path}"
+    if [[ "$val" == *"'"* ]] || [[ "$val" == *'"'* ]] || [[ "$val" == *$'\n'* ]] || [[ "$val" == *$'\r'* ]]; then
+        echo "[puppet-trace] ERROR: $name contains unsafe characters (quotes/newlines): '$val'" >&2
+        return 1
+    fi
+}
+
 export PATH="/opt/puppetlabs/bin:/opt/puppetlabs/puppet/bin:$PATH"
 
 ###############################################################################
@@ -137,6 +145,11 @@ cmd_collect() {
     fi
 
     local transaction_uuid="${PUPPET_TRANSACTION_UUID:-}"
+    # Validate UUID format (allow empty)
+    if [[ -n "$transaction_uuid" ]] && [[ ! "$transaction_uuid" =~ ^[a-fA-F0-9-]+$ ]]; then
+        echo "[puppet-trace] WARNING: PUPPET_TRANSACTION_UUID has unexpected format, ignoring" >&2
+        transaction_uuid=""
+    fi
     local TIMESTAMP
     TIMESTAMP=$(date +%Y%m%d-%H%M%S)
     local OUTDIR="/var/log/puppet-trace/${TIMESTAMP}"
@@ -165,6 +178,11 @@ cmd_collect() {
         || date -u -d "@$(($(date +%s) - window_min * 60))" +%Y-%m-%dT%H:%M:%S 2>/dev/null \
         || "")
 
+    if [[ -n "$start_iso" ]] && [[ ! "$start_iso" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z?$ ]]; then
+        echo "[puppet-trace] WARNING: start_iso has unexpected format, ignoring: $start_iso" >&2
+        start_iso=""
+    fi
+
     if [[ -n "$start_iso" ]]; then
         since_arg="$start_iso"
     fi
@@ -172,6 +190,8 @@ cmd_collect() {
     local puppet_server
     puppet_server=$(puppet config print server 2>/dev/null | tr -d '\n' || true)
     [[ -z "$puppet_server" ]] && puppet_server="$(hostname -f 2>/dev/null || hostname)"
+    _validate_puppet_id "$puppet_server" "puppet_server" || puppet_server=""
+    [[ -z "$puppet_server" ]] && { echo "[puppet-trace] ERROR: could not determine puppet server" >&2; return 1; }
 
     local _ssh_user="${PUPPET_TRACE_SSH_USER:-puppet}"
     local _ssh_key="${PUPPET_TRACE_SSH_KEY:-${HOME}/.ssh/id_ed25519}"
@@ -522,8 +542,16 @@ resource_count = sum(1 for l in puppet_lines if re.search(r'^Notice: /Stage', l)
 # ── profile flamegraph ────────────────────────────────────────────────────────
 import re as _re
 def _sanitize_svg(s):
-    s = _re.sub(r'<script[^>]*>.*?</script>', '', s, flags=_re.DOTALL|_re.IGNORECASE)
-    s = _re.sub(r'\bon\w+\s*=', 'data-removed=', s, flags=_re.IGNORECASE)
+    # Remove <script> blocks (handles src= variants with no closing tag too)
+    s = _re.sub(r'<script\b[^>]*>.*?</script>', '', s, flags=_re.DOTALL|_re.IGNORECASE)
+    s = _re.sub(r'<script\b[^>]*/?\s*>', '', s, flags=_re.IGNORECASE)  # self-closing or unclosed
+    # Remove javascript: URI schemes in href and xlink:href
+    s = _re.sub(r'((?:xlink:)?href\s*=\s*["\'])javascript:[^"\']*(["\'])', r'\1#\2', s, flags=_re.IGNORECASE)
+    # Remove on* event handlers
+    s = _re.sub(r'\bon\w+\s*=\s*(?:"[^"]*"|\'[^\']*\'|\S+)', '', s, flags=_re.IGNORECASE)
+    # Remove data: URIs in href/src (potential XSS vector)
+    s = _re.sub(r'((?:xlink:)?href\s*=\s*["\'])data:[^"\']*(["\'])', r'\1#\2', s, flags=_re.IGNORECASE)
+    s = _re.sub(r'(src\s*=\s*["\'])data:[^"\']*(["\'])', r'\1#\2', s, flags=_re.IGNORECASE)
     return s
 
 if os.path.isfile(profile_flamegraph_svg) and os.path.getsize(profile_flamegraph_svg) > 0:
@@ -762,6 +790,8 @@ done
 if [[ ${#PUPPET_CMD[@]} -eq 0 ]]; then
     PUPPET_CMD=(puppet agent --test --profile --evaltrace)
 fi
+
+_validate_safe_path "$OUTDIR" "--outdir" || exit 1
 
 [[ -z "${_LATE_SUBCMD:-}" ]] && mkdir -m 0700 -p "$OUTDIR"
 PUPPET_LOG="$OUTDIR/puppet.log"
@@ -1273,6 +1303,12 @@ run_puppet() {
     if id "$puppet_run_user" &>/dev/null && [[ $EUID -eq 0 ]]; then
         run_as_user=(sudo -u "$puppet_run_user" --)
     fi
+    if [[ ${#run_as_user[@]} -gt 0 ]]; then
+        if ! "${run_as_user[@]}" true 2>/dev/null; then
+            echo "[puppet-trace] WARNING: sudo -u $puppet_run_user failed — falling back to root. Install puppet-trace.sudoers to run puppet as $puppet_run_user." >&2
+            run_as_user=()
+        fi
+    fi
 
     if $HAS_STRACE && $IS_ROOT; then
         echo "[puppet-trace] running puppet under strace (full I/O correlation mode)"
@@ -1396,9 +1432,22 @@ IDEMPOTENCY_PASS=unknown
 IDEMPOTENCY_CHANGES=0
 
 run_idempotency_check() {
-    echo "[puppet-trace] running idempotency check (--noop)..."
-    /opt/puppetlabs/bin/puppet agent --test --noop \
-        >"$IDEMPOTENCY_STDOUT" 2>&1 || true
+    local puppet_run_user="${PUPPET_TRACE_PUPPET_USER:-puppet}"
+    local run_as_user=()
+    if id "$puppet_run_user" &>/dev/null && [[ $EUID -eq 0 ]]; then
+        run_as_user=(sudo -u "$puppet_run_user" --)
+    fi
+    if [[ ${#run_as_user[@]} -gt 0 ]]; then
+        if ! "${run_as_user[@]}" true 2>/dev/null; then
+            echo "[puppet-trace] WARNING: sudo -u $puppet_run_user failed — falling back to root. Install puppet-trace.sudoers to run puppet as $puppet_run_user." >&2
+            run_as_user=()
+        fi
+    fi
+
+    echo "[puppet-trace] idempotency check (--noop run)..."
+    local idem_exit=0
+    "${run_as_user[@]}" /opt/puppetlabs/bin/puppet agent --test --noop \
+        >"$IDEMPOTENCY_STDOUT" 2>&1 || idem_exit=$?
     IDEMPOTENCY_CHANGES=$(grep -cE \
         'would have triggered|would have changed|Notice.*changed' \
         "$IDEMPOTENCY_STDOUT" 2>/dev/null; true)
@@ -1515,6 +1564,10 @@ enrich_from_puppetdb() {
     [[ -z "$certname" ]] && certname=$(puppet config print certname 2>/dev/null | tr -d '\n' || hostname -f 2>/dev/null || hostname)
     puppet_server="${PUPPET_SERVER:-$(puppet config print server 2>/dev/null | tr -d '\n' || true)}"
     [[ -z "$puppet_server" ]] && puppet_server="$(hostname -f 2>/dev/null || hostname)"
+    if [[ -n "$puppet_server" ]]; then
+        _validate_puppet_id "$puppet_server" "puppet_server" || puppet_server=""
+    fi
+    [[ -z "$puppet_server" ]] && { echo "[puppet-trace] ERROR: could not determine puppet server for PuppetDB enrichment" >&2; return 1; }
     ssh_user="${PUPPET_TRACE_SSH_USER:-puppet}"
     ssh_key="${PUPPET_TRACE_SSH_KEY:-${HOME}/.ssh/id_ed25519}"
     local _pdb_container="${PUPPET_TRACE_PDB_CONTAINER:-puppetdb}"
@@ -2049,6 +2102,8 @@ collect_profile_flamegraph() {
     local puppet_server ssh_key _ssh_opts
     puppet_server=$(puppet config print server 2>/dev/null | tr -d '\n' || true)
     [[ -z "$puppet_server" ]] && puppet_server="$(hostname -f 2>/dev/null || hostname)"
+    _validate_puppet_id "$puppet_server" "puppet_server" || puppet_server=""
+    [[ -z "$puppet_server" ]] && { echo "[puppet-trace] ERROR: could not determine puppet server for profile flamegraph" >&2; return 1; }
     local _ssh_user2="${PUPPET_TRACE_SSH_USER:-puppet}"
     ssh_key="${PUPPET_TRACE_SSH_KEY:-${HOME}/.ssh/id_ed25519}"
     local _server_container2="${PUPPET_TRACE_SERVER_CONTAINER:-puppetserver}"
@@ -2057,6 +2112,11 @@ collect_profile_flamegraph() {
     mkdir -m 0700 -p /var/log/puppet-trace/
     _ssh_opts=(-o ConnectTimeout=10 -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/var/log/puppet-trace/.ssh_known_hosts)
     [[ -f "$ssh_key" ]] && _ssh_opts+=(-i "$ssh_key")
+
+    if [[ -n "$start_iso" ]] && [[ ! "$start_iso" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z?$ ]]; then
+        echo "[puppet-trace] WARNING: start_iso has unexpected format, ignoring: $start_iso" >&2
+        start_iso=""
+    fi
 
     echo "[puppet-trace] fetching PROFILE entries from puppetserver (${puppet_server}) docker logs since ${start_iso}..."
 
@@ -2492,8 +2552,16 @@ def make_bar_chart(step_list, wall_total, width=700):
 import re as _re
 import html as _html_mod
 def _sanitize_svg(s):
-    s = _re.sub(r'<script[^>]*>.*?</script>', '', s, flags=_re.DOTALL|_re.IGNORECASE)
-    s = _re.sub(r'\bon\w+\s*=', 'data-removed=', s, flags=_re.IGNORECASE)
+    # Remove <script> blocks (handles src= variants with no closing tag too)
+    s = _re.sub(r'<script\b[^>]*>.*?</script>', '', s, flags=_re.DOTALL|_re.IGNORECASE)
+    s = _re.sub(r'<script\b[^>]*/?\s*>', '', s, flags=_re.IGNORECASE)  # self-closing or unclosed
+    # Remove javascript: URI schemes in href and xlink:href
+    s = _re.sub(r'((?:xlink:)?href\s*=\s*["\'])javascript:[^"\']*(["\'])', r'\1#\2', s, flags=_re.IGNORECASE)
+    # Remove on* event handlers
+    s = _re.sub(r'\bon\w+\s*=\s*(?:"[^"]*"|\'[^\']*\'|\S+)', '', s, flags=_re.IGNORECASE)
+    # Remove data: URIs in href/src (potential XSS vector)
+    s = _re.sub(r'((?:xlink:)?href\s*=\s*["\'])data:[^"\']*(["\'])', r'\1#\2', s, flags=_re.IGNORECASE)
+    s = _re.sub(r'(src\s*=\s*["\'])data:[^"\']*(["\'])', r'\1#\2', s, flags=_re.IGNORECASE)
     return s
 
 flamegraph_section = ''
@@ -2936,6 +3004,7 @@ cmd_report() {
     fi
     [[ -d "$outdir" ]] || { echo "report: not a directory: $outdir" >&2; exit 1; }
     outdir="${outdir%/}"
+    _validate_safe_path "$outdir" "outdir" || exit 1
 
     local meta="$outdir/run-meta.json"
     WALL_SECONDS=0; PUPPET_EXIT=0; PUPPET_CMD_META="puppet agent --test"
@@ -2949,6 +3018,12 @@ cmd_report() {
         RUN_START_ISO=$(python3 -c "import json; d=json.load(open('$meta')); print(d.get('run_start_iso',''))" 2>/dev/null || echo "")
     else
         echo "[puppet-trace report] WARNING: run-meta.json not found in $outdir — using defaults" >&2
+    fi
+
+    # Validate ISO date format before use in SSH --since arg
+    if [[ -n "$RUN_START_ISO" ]] && [[ ! "$RUN_START_ISO" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z?$ ]]; then
+        echo "[puppet-trace] WARNING: run_start_iso has unexpected format, ignoring: $RUN_START_ISO" >&2
+        RUN_START_ISO=""
     fi
 
     OUTDIR="$outdir"
@@ -2998,6 +3073,7 @@ cmd_ship() {
     shift 2
     [[ -d "$outdir" ]] || { echo "ship: not a directory: $outdir" >&2; exit 1; }
     outdir="${outdir%/}"
+    _validate_safe_path "$outdir" "outdir" || exit 1
 
     local include_strace=false rsync_extra=()
     for arg in "$@"; do
@@ -3007,6 +3083,7 @@ cmd_ship() {
     local remote_host="${remote%%:*}"
     local remote_path="${remote#*:}"
     [[ "$remote_path" == "$remote_host" ]] && { echo "ship: remote must be [user@]host:path" >&2; exit 1; }
+    _validate_safe_path "$remote_path" "remote path" || exit 1
 
     local exclude_args=(--exclude='strace.raw' --exclude='perf.data')
     $include_strace && exclude_args=()
