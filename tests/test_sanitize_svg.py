@@ -273,3 +273,39 @@ def test_style_non_url_preserved():
     result = _sanitize_svg(clean)
     assert 'font-size:12px' in result
     assert 'fill:#333' in result
+
+
+# ── R6-1 (round 6): foreignObject and use element stripping ───────────────────
+
+
+def test_foreignobject_stripped():
+    """foreignObject embedding arbitrary HTML+script is stripped (R6-1)."""
+    dirty = '<svg><foreignObject><script>alert(1)</script></foreignObject><text>safe</text></svg>'
+    result = _sanitize_svg(dirty)
+    assert '<foreignObject>' not in result.lower()
+    assert 'alert(1)' not in result
+    assert '<text>safe</text>' in result
+
+
+def test_foreignobject_self_closing_stripped():
+    """Self-closing foreignObject is stripped (R6-1)."""
+    dirty = '<svg><foreignObject width="100" height="100"/><text>ok</text></svg>'
+    result = _sanitize_svg(dirty)
+    assert 'foreignobject' not in result.lower()
+    assert '<text>ok</text>' in result
+
+
+def test_use_element_stripped():
+    """use element referencing external SVG fragment is stripped (R6-1)."""
+    dirty = '<svg><use href="http://evil.com/x.svg#payload"/><text>ok</text></svg>'
+    result = _sanitize_svg(dirty)
+    assert '<use' not in result.lower()
+    assert '<text>ok</text>' in result
+
+
+def test_use_self_closing_stripped():
+    """Self-closing use element is stripped (R6-1)."""
+    dirty = '<svg><USE xlink:href="#fragment"/><text>safe</text></svg>'
+    result = _sanitize_svg(dirty)
+    assert '<use' not in result.lower()
+    assert '<text>safe</text>' in result

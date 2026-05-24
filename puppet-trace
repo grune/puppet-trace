@@ -93,7 +93,7 @@ cmd_enable() {
     else
         [[ -L "$PUPPET_CONF" ]] && echo "[puppet-trace] NOTE: $PUPPET_CONF is a symlink — editing the symlink target in place" >&2
         local _pt_conf_tmp
-        _pt_conf_tmp=$(mktemp)
+        _pt_conf_tmp=$(mktemp -p /var/log/puppet-trace)
         # Remove any existing puppet-trace postrun line first (idempotent), then insert under first [agent] only
         if grep -q '^\[agent\]' "$PUPPET_CONF"; then
             awk '
@@ -130,7 +130,7 @@ cmd_disable() {
 
     if [[ -f "$PUPPET_CONF" ]]; then
         local _pt_conf_tmp
-        _pt_conf_tmp=$(mktemp)
+        _pt_conf_tmp=$(mktemp -p /var/log/puppet-trace)
         grep -v 'postrun_command[[:space:]]*=[[:space:]]*\/usr\/local\/bin\/puppet-trace collect' "$PUPPET_CONF" > "$_pt_conf_tmp" || true
         cat "$_pt_conf_tmp" > "$PUPPET_CONF"
         rm -f "$_pt_conf_tmp"
@@ -605,6 +605,12 @@ def _sanitize_svg(s):
     # Remove animate/set elements that can animate href to javascript: URIs
     s = _re.sub(r'<(?:animate|set)\b[^>]*/?\s*>', '', s, flags=_re.IGNORECASE)
     s = _re.sub(r'<(?:animate|set)\b.*?</(?:animate|set)>', '', s, flags=_re.DOTALL|_re.IGNORECASE)
+    # Remove foreignObject — can embed arbitrary HTML+<script> when SVG inlined in HTML
+    s = _re.sub(r'<foreignObject\b.*?</foreignObject>', '', s, flags=_re.DOTALL|_re.IGNORECASE)
+    s = _re.sub(r'<foreignObject\b[^>]*/?\s*>', '', s, flags=_re.IGNORECASE)
+    # Remove <use> elements — can reference external SVG fragments via href
+    s = _re.sub(r'<use\b.*?</use>', '', s, flags=_re.DOTALL|_re.IGNORECASE)
+    s = _re.sub(r'<use\b[^>]*/?\s*>', '', s, flags=_re.IGNORECASE)
     # Allowlist href attributes: only allow #anchors and http(s):// URLs
     # Catches javascript:, vbscript:, data:, entity-encoded schemes, tab-split, etc.
     def _clean_href(m):
@@ -774,8 +780,10 @@ HTML = f'''<!DOCTYPE html>
 </html>
 '''
 
+import os as _os; _old_umask = _os.umask(0o077)
 with open(report_html, 'w') as f:
     f.write(HTML)
+_os.umask(_old_umask)
 print(f"Report: {report_html}")
 PYEOF
 }
@@ -1403,7 +1411,7 @@ run_puppet() {
 
     if $HAS_STRACE && $IS_ROOT; then
         echo "[puppet-trace] running puppet under strace (full I/O correlation mode)"
-        strace -f -ttt \
+        strace -f -ttt -s 0 \
             -e trace=openat,open,read,write,execve,clone,exit_group,connect,sendto,recvfrom \
             -o "$STRACE_RAW" \
             "${run_as_user[@]}" "${PUPPET_CMD[@]}" >"$PUPPET_LOG" 2>&1 &
@@ -1793,6 +1801,15 @@ run_strace_correlation() {
         return
     fi
 
+    # Size sentinel: skip correlation on very large strace files to prevent OOM
+    local strace_size
+    strace_size=$(stat -c%s "$STRACE_RAW" 2>/dev/null || echo 0)
+    local strace_max_bytes=$(( 512 * 1024 * 1024 ))  # 512MB
+    if [[ "$strace_size" -gt "$strace_max_bytes" ]]; then
+        echo "[puppet-trace] WARNING: strace.raw is ${strace_size} bytes (>${strace_max_bytes}) — skipping correlation to avoid OOM. Use --no-strace or increase disk space." >&2
+        return
+    fi
+
     echo "[puppet-trace] running strace I/O correlation engine..."
     python3 - "$STRACE_RAW" "$PUPPET_LOG" "$resource_report" "$IO_CORR_JSON" "$PROC_LOG" <<'PYEOF'
 import sys, os, re, json, collections
@@ -2149,7 +2166,7 @@ generate_flamegraph() {
     if [[ -s "$STACK_LOG" ]]; then
         echo "[puppet-trace] generating stack summary from /proc stack samples..."
         python3 - "$STACK_LOG" "$FLAMEGRAPH_SVG" <<'PYEOF'
-import sys, re, collections
+import sys, re, collections, html
 
 stack_log = sys.argv[1]
 svg_out = sys.argv[2]
@@ -2190,10 +2207,10 @@ for i, (stack, count) in enumerate(rows):
     pct = count / total * 100
     bar_w = int(pct / 100 * 600)
     color = "#4a90d9" if i % 2 == 0 else "#357abd"
-    frame = stack.split(';')[-1] if stack else '(unknown)'
+    frame = html.escape(stack.split(';')[-1][:60] if stack else '(unknown)')
     lines.append('<rect x="10" y="{}" width="{}" height="18" fill="{}"/>'.format(y, bar_w, color))
     lines.append('<text x="{}" y="{}" font-family="monospace" font-size="11" fill="#222">{:.1f}% ({}) {}</text>'.format(
-        bar_w + 16, y + 13, pct, count, frame[:60]))
+        bar_w + 16, y + 13, pct, count, frame))
 
 lines.append('</svg>')
 
@@ -2675,6 +2692,12 @@ def _sanitize_svg(s):
     # Remove animate/set elements that can animate href to javascript: URIs
     s = _re.sub(r'<(?:animate|set)\b[^>]*/?\s*>', '', s, flags=_re.IGNORECASE)
     s = _re.sub(r'<(?:animate|set)\b.*?</(?:animate|set)>', '', s, flags=_re.DOTALL|_re.IGNORECASE)
+    # Remove foreignObject — can embed arbitrary HTML+<script> when SVG inlined in HTML
+    s = _re.sub(r'<foreignObject\b.*?</foreignObject>', '', s, flags=_re.DOTALL|_re.IGNORECASE)
+    s = _re.sub(r'<foreignObject\b[^>]*/?\s*>', '', s, flags=_re.IGNORECASE)
+    # Remove <use> elements — can reference external SVG fragments via href
+    s = _re.sub(r'<use\b.*?</use>', '', s, flags=_re.DOTALL|_re.IGNORECASE)
+    s = _re.sub(r'<use\b[^>]*/?\s*>', '', s, flags=_re.IGNORECASE)
     # Allowlist href attributes: only allow #anchors and http(s):// URLs
     # Catches javascript:, vbscript:, data:, entity-encoded schemes, tab-split, etc.
     def _clean_href(m):
@@ -3122,8 +3145,10 @@ function sortTable(n) {{
 </html>
 '''
 
+import os as _os; _old_umask = _os.umask(0o077)
 with open(report_html, 'w') as f:
     f.write(HTML)
+_os.umask(_old_umask)
 print(f"Report written: {report_html}")
 PYEOF
 }
@@ -3246,9 +3271,11 @@ cmd_ship() {
     $include_strace && exclude_args=()
 
     echo "[puppet-trace ship] $outdir → $remote (${exclude_args[*]:-no exclusions})"
-    rsync -av --progress "${exclude_args[@]}" "${rsync_extra[@]}" "$outdir/" "${remote}/"
+    rsync -av --progress --chmod=D0700,F0600 "${exclude_args[@]}" "${rsync_extra[@]}" "$outdir/" "${remote}/"
     echo "[puppet-trace ship] synced — running report on $remote_host..."
-    ssh -o BatchMode=yes -o ConnectTimeout=30 -o StrictHostKeyChecking=yes "$remote_host" puppet-trace report -- "$remote_path"
+    # shellcheck disable=SC2029  # printf %q is intentional — quotes path for remote shell
+    ssh -o BatchMode=yes -o ConnectTimeout=30 -o StrictHostKeyChecking=yes "$remote_host" \
+        "puppet-trace report -- $(printf '%q' "$remote_path")"
     echo "[puppet-trace ship] done — report at $remote_host:${remote_path}/report.html"
 }
 

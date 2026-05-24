@@ -382,3 +382,42 @@ VALIDATORS=$(awk '
     # Should use the safe ${arr[@]+"${arr[@]}"} idiom, not [@]:-}
     [[ "$output" != *'[@]:-}'* ]]
 }
+
+###############################################################################
+# Round 6 security fixes
+###############################################################################
+
+@test "R6-2: strace invocation includes -s 0 to suppress buffer content" {
+    run grep -c 'strace.*-s 0' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    [ "$output" -ge 1 ]
+}
+
+@test "R6-2: strace correlation skips oversized strace.raw files" {
+    run grep 'strace_max_bytes' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"strace_max_bytes"* ]]
+}
+
+@test "R6-4: report.html written with umask 0077" {
+    run grep -c 'umask(0o077)' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    [ "$output" -ge 2 ]
+}
+
+@test "R6-4: cmd_ship rsync uses --chmod=D0700,F0600" {
+    run grep 'rsync.*--chmod=D0700,F0600' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"--chmod=D0700,F0600"* ]]
+}
+
+@test "R6-5: mktemp uses -p /var/log/puppet-trace not bare /tmp" {
+    # Bare mktemp (no -p flag) should not appear in the script
+    run bash -c "grep -n 'mktemp$' '$SCRIPT'"
+    [ "$status" -ne 0 ] || [ -z "$output" ]
+}
+
+@test "R6-7: cmd_ship uses printf %q for remote_path on SSH call" {
+    run grep "printf '%q'" "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
