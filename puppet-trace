@@ -279,8 +279,8 @@ cmd_collect() {
         cat /proc/meminfo 2>/dev/null || true
         echo "=== df -h ==="
         df -h 2>/dev/null || true
-        echo "=== ss -tnp ==="
-        ss -tnp 2>/dev/null || true
+        echo "=== ss -tn ==="
+        ss -tn 2>/dev/null || true
     } > "$SYSCTX" 2>/dev/null || true
 
     # ── parse last_run_report.yaml ─────────────────────────────────
@@ -1323,7 +1323,8 @@ net_poller() {
         ts=$(date +%s)
         echo "# ts=$ts" >>"$outfile"
         if command -v ss &>/dev/null; then
-            ss -tnp 2>/dev/null | grep "pid=$pid," >>"$outfile" || true
+            # -p omitted: process names expose full TCP map across all services (#7471)
+            ss -tn 2>/dev/null >>"$outfile" || true
         elif command -v netstat &>/dev/null; then
             netstat -tn 2>/dev/null >>"$outfile" || true
         fi
@@ -1474,11 +1475,15 @@ run_puppet() {
         _PT_CLEANUP_PIDS+=("$PERF_PID")
     fi
 
+    # pmap calls: PMAP_START and PMAP_END are synchronous — no cleanup needed.
+    # PMAP_MID runs in a background subshell (sleep 10 then snapshot); track its PID (#7515).
     (
         trap - EXIT INT TERM
         sleep 10
         pmap -x "$PUPPET_PID" >"$PMAP_MID" 2>/dev/null || echo "(pmap unavailable)" >"$PMAP_MID"
     ) &
+    PMAP_MID_PID=$!
+    _PT_CLEANUP_PIDS+=("$PMAP_MID_PID")
 
     wait "$PUPPET_PID"
     PUPPET_EXIT=$?
@@ -1501,8 +1506,8 @@ run_puppet() {
         cat /proc/meminfo 2>/dev/null || true
         echo "=== df -h ==="
         df -h 2>/dev/null || true
-        echo "=== ss -tnp ==="
-        ss -tnp 2>/dev/null || true
+        echo "=== ss -tn ==="
+        ss -tn 2>/dev/null || true
     } >"$OUTDIR/sysctx-after.txt" 2>/dev/null || true
 
     echo "[puppet-trace] puppet exited with code $PUPPET_EXIT after ${WALL_SECONDS}s"
