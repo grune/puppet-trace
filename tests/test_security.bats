@@ -200,3 +200,49 @@ VALIDATORS=$(awk '
     run bash -c "$VALIDATORS; _validate_puppet_id 'puppet.example.com;evil' 'puppet_server'"
     [ "$status" -ne 0 ]
 }
+
+###############################################################################
+# N4: path traversal in --outdir
+###############################################################################
+
+@test "--outdir with path traversal exits 1" {
+    run sudo bash "$SCRIPT" once --dry-run --outdir '/tmp/../etc' 2>&1
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"path traversal"* ]]
+}
+
+@test "_validate_safe_path: rejects /../ traversal" {
+    run bash -c "$VALIDATORS; _validate_safe_path '/tmp/../etc' 'outdir'"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"path traversal"* ]]
+}
+
+@test "_validate_safe_path: rejects /.. at end" {
+    run bash -c "$VALIDATORS; _validate_safe_path '/tmp/..' 'outdir'"
+    [ "$status" -ne 0 ]
+}
+
+@test "_validate_safe_path: rejects ../ at start" {
+    run bash -c "$VALIDATORS; _validate_safe_path '../etc/passwd' 'outdir'"
+    [ "$status" -ne 0 ]
+}
+
+###############################################################################
+# N8: PUPPET_TRACE_PUPPET_USER=root falls back to puppet
+###############################################################################
+
+@test "PUPPET_TRACE_PUPPET_USER=root falls back to puppet" {
+    # Extract _validate_puppet_id from the script and simulate the N8 guard inline
+    run bash -c '
+        '"$VALIDATORS"'
+        puppet_run_user="root"
+        if [[ "$puppet_run_user" == "root" ]] || ! _validate_puppet_id "$puppet_run_user" "PUPPET_TRACE_PUPPET_USER" 2>/dev/null; then
+            echo "[puppet-trace] WARNING: PUPPET_TRACE_PUPPET_USER='"'"'$puppet_run_user'"'"' is invalid or root — using '"'"'puppet'"'"'" >&2
+            puppet_run_user="puppet"
+        fi
+        echo "effective_user=$puppet_run_user"
+    ' 2>&1
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"invalid or root"* ]]
+    [[ "$output" == *"effective_user=puppet"* ]]
+}

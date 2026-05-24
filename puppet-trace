@@ -30,7 +30,28 @@ _validate_safe_path() {
         echo "[puppet-trace] ERROR: $name contains unsafe characters (quotes/newlines): '$val'" >&2
         return 1
     fi
+    # Block path traversal
+    if [[ "$val" == *"/../"* ]] || [[ "$val" == *"/.."  ]] || [[ "$val" == "../"* ]]; then
+        echo "[puppet-trace] ERROR: $name contains path traversal: '$val'" >&2
+        return 1
+    fi
 }
+
+# Cleanup trap — kill background processes on exit/interrupt
+_PT_CLEANUP_PIDS=()
+_pt_cleanup() {
+    local sig="${1:-EXIT}"
+    for pid in "${_PT_CLEANUP_PIDS[@]:-}"; do
+        kill "$pid" 2>/dev/null || true
+    done
+    # Restart puppet service if we stopped it
+    if [[ "${_PT_STOPPED_PUPPET:-false}" == "true" ]]; then
+        systemctl start puppet 2>/dev/null || true
+    fi
+}
+trap '_pt_cleanup INT'  INT
+trap '_pt_cleanup TERM' TERM
+trap '_pt_cleanup EXIT' EXIT
 
 export PATH="/opt/puppetlabs/bin:/opt/puppetlabs/puppet/bin:$PATH"
 
@@ -542,16 +563,20 @@ resource_count = sum(1 for l in puppet_lines if re.search(r'^Notice: /Stage', l)
 # ── profile flamegraph ────────────────────────────────────────────────────────
 import re as _re
 def _sanitize_svg(s):
-    # Remove <script> blocks (handles src= variants with no closing tag too)
+    import re as _re
+    # Remove <script> blocks including self-closing/unclosed variants
     s = _re.sub(r'<script\b[^>]*>.*?</script>', '', s, flags=_re.DOTALL|_re.IGNORECASE)
-    s = _re.sub(r'<script\b[^>]*/?\s*>', '', s, flags=_re.IGNORECASE)  # self-closing or unclosed
-    # Remove javascript: URI schemes in href and xlink:href
-    s = _re.sub(r'((?:xlink:)?href\s*=\s*["\'])javascript:[^"\']*(["\'])', r'\1#\2', s, flags=_re.IGNORECASE)
-    # Remove on* event handlers
+    s = _re.sub(r'<script\b[^>]*/?\s*>', '', s, flags=_re.IGNORECASE)
+    # Remove animate/set elements that can animate href to javascript: URIs
+    s = _re.sub(r'<(?:animate|set)\b[^>]*/?\s*>', '', s, flags=_re.IGNORECASE)
+    s = _re.sub(r'<(?:animate|set)\b.*?</(?:animate|set)>', '', s, flags=_re.DOTALL|_re.IGNORECASE)
+    # Neutralize javascript: URIs in href attributes (quoted and unquoted)
+    s = _re.sub(r'((?:xlink:)?href\s*=\s*["\']?)javascript:', r'\1#', s, flags=_re.IGNORECASE)
+    # Neutralize data: URIs in href/src (quoted and unquoted)
+    s = _re.sub(r'((?:xlink:)?href\s*=\s*["\']?)data:', r'\1#', s, flags=_re.IGNORECASE)
+    s = _re.sub(r'(src\s*=\s*["\']?)data:', r'\1#', s, flags=_re.IGNORECASE)
+    # Remove on* event handlers (quoted, single-quoted, and unquoted values)
     s = _re.sub(r'\bon\w+\s*=\s*(?:"[^"]*"|\'[^\']*\'|\S+)', '', s, flags=_re.IGNORECASE)
-    # Remove data: URIs in href/src (potential XSS vector)
-    s = _re.sub(r'((?:xlink:)?href\s*=\s*["\'])data:[^"\']*(["\'])', r'\1#\2', s, flags=_re.IGNORECASE)
-    s = _re.sub(r'(src\s*=\s*["\'])data:[^"\']*(["\'])', r'\1#\2', s, flags=_re.IGNORECASE)
     return s
 
 if os.path.isfile(profile_flamegraph_svg) and os.path.getsize(profile_flamegraph_svg) > 0:
@@ -1198,7 +1223,9 @@ proc_poller() {
     local pid=$1
     local outfile=$2
     local elapsed=0
-    while kill -0 "$pid" 2>/dev/null; do
+    # Use end-time sentinel instead of pure PID liveness to avoid PID-reuse confusion
+    local deadline=$(( $(date +%s) + 3600 ))  # max 1 hour
+    while kill -0 "$pid" 2>/dev/null && [[ $(date +%s) -lt $deadline ]]; do
         local ts
         ts=$(date +%s)
         local rss=0 vmpeak=0 vmswap=0
@@ -1227,7 +1254,9 @@ proc_poller() {
 net_poller() {
     local pid=$1
     local outfile=$2
-    while kill -0 "$pid" 2>/dev/null; do
+    # Use end-time sentinel instead of pure PID liveness to avoid PID-reuse confusion
+    local deadline=$(( $(date +%s) + 3600 ))  # max 1 hour
+    while kill -0 "$pid" 2>/dev/null && [[ $(date +%s) -lt $deadline ]]; do
         local ts
         ts=$(date +%s)
         echo "# ts=$ts" >>"$outfile"
@@ -1270,6 +1299,7 @@ _stop_puppet_service() {
             systemctl stop puppet 2>/dev/null && _PUPPET_SVC_STOPPED=true \
                 && echo "[puppet-trace] puppet.service stopped" \
                 || echo "[puppet-trace] WARNING: could not stop puppet.service" >&2
+            _PT_STOPPED_PUPPET=true
         fi
         rm -f "$lock"
     fi
@@ -1299,6 +1329,11 @@ run_puppet() {
     } >"$OUTDIR/sysctx-before.txt" 2>/dev/null || true
 
     local puppet_run_user="${PUPPET_TRACE_PUPPET_USER:-puppet}"
+    # Validate puppet user — must not be root or contain special chars
+    if [[ "$puppet_run_user" == "root" ]] || ! _validate_puppet_id "$puppet_run_user" "PUPPET_TRACE_PUPPET_USER" 2>/dev/null; then
+        echo "[puppet-trace] WARNING: PUPPET_TRACE_PUPPET_USER='$puppet_run_user' is invalid or root — using 'puppet'" >&2
+        puppet_run_user="puppet"
+    fi
     local run_as_user=()
     if id "$puppet_run_user" &>/dev/null && [[ $EUID -eq 0 ]]; then
         run_as_user=(sudo -u "$puppet_run_user" --)
@@ -1330,14 +1365,17 @@ run_puppet() {
 
     proc_poller "$PUPPET_PID" "$PROC_LOG" &
     PROC_POLLER_PID=$!
+    _PT_CLEANUP_PIDS+=("$PROC_POLLER_PID")
 
     net_poller "$PUPPET_PID" "$NET_LOG" &
     NET_POLLER_PID=$!
+    _PT_CLEANUP_PIDS+=("$NET_POLLER_PID")
 
     # /proc/PID/io poller for per-resource delta tracking
     IO_POLL_LOG="$OUTDIR/proc-io-poll.log"
     {
-        while kill -0 "$PUPPET_PID" 2>/dev/null; do
+        local io_deadline=$(( $(date +%s) + 3600 ))
+        while kill -0 "$PUPPET_PID" 2>/dev/null && [[ $(date +%s) -lt $io_deadline ]]; do
             local ts rb wb
             ts=$(date +%s%3N)
             rb=$(awk '/^read_bytes/{print $2}' /proc/$PUPPET_PID/io 2>/dev/null || echo 0)
@@ -1347,6 +1385,7 @@ run_puppet() {
         done
     } >>"$IO_POLL_LOG" &
     IO_POLLER_PID=$!
+    _PT_CLEANUP_PIDS+=("$IO_POLLER_PID")
 
     STRACE_PID=""
     if ! $HAS_STRACE || ! $IS_ROOT; then
@@ -1355,6 +1394,7 @@ run_puppet() {
                 --format '%T %e %w%f' --timefmt '%s' \
                 >"$INOTIFY_LOG" 2>/dev/null &
             STRACE_PID=$!
+            _PT_CLEANUP_PIDS+=("$STRACE_PID")
         fi
     fi
 
@@ -1362,9 +1402,11 @@ run_puppet() {
     if $HAS_PERF && $IS_ROOT; then
         perf record -g -p "$PUPPET_PID" -o "$PERF_DATA" 2>/dev/null &
         PERF_PID=$!
+        _PT_CLEANUP_PIDS+=("$PERF_PID")
     else
         stack_sampler "$PUPPET_PID" "$STACK_LOG" &
         PERF_PID=$!
+        _PT_CLEANUP_PIDS+=("$PERF_PID")
     fi
 
     (
@@ -1433,6 +1475,11 @@ IDEMPOTENCY_CHANGES=0
 
 run_idempotency_check() {
     local puppet_run_user="${PUPPET_TRACE_PUPPET_USER:-puppet}"
+    # Validate puppet user — must not be root or contain special chars
+    if [[ "$puppet_run_user" == "root" ]] || ! _validate_puppet_id "$puppet_run_user" "PUPPET_TRACE_PUPPET_USER" 2>/dev/null; then
+        echo "[puppet-trace] WARNING: PUPPET_TRACE_PUPPET_USER='$puppet_run_user' is invalid or root — using 'puppet'" >&2
+        puppet_run_user="puppet"
+    fi
     local run_as_user=()
     if id "$puppet_run_user" &>/dev/null && [[ $EUID -eq 0 ]]; then
         run_as_user=(sudo -u "$puppet_run_user" --)
@@ -2552,16 +2599,20 @@ def make_bar_chart(step_list, wall_total, width=700):
 import re as _re
 import html as _html_mod
 def _sanitize_svg(s):
-    # Remove <script> blocks (handles src= variants with no closing tag too)
+    import re as _re
+    # Remove <script> blocks including self-closing/unclosed variants
     s = _re.sub(r'<script\b[^>]*>.*?</script>', '', s, flags=_re.DOTALL|_re.IGNORECASE)
-    s = _re.sub(r'<script\b[^>]*/?\s*>', '', s, flags=_re.IGNORECASE)  # self-closing or unclosed
-    # Remove javascript: URI schemes in href and xlink:href
-    s = _re.sub(r'((?:xlink:)?href\s*=\s*["\'])javascript:[^"\']*(["\'])', r'\1#\2', s, flags=_re.IGNORECASE)
-    # Remove on* event handlers
+    s = _re.sub(r'<script\b[^>]*/?\s*>', '', s, flags=_re.IGNORECASE)
+    # Remove animate/set elements that can animate href to javascript: URIs
+    s = _re.sub(r'<(?:animate|set)\b[^>]*/?\s*>', '', s, flags=_re.IGNORECASE)
+    s = _re.sub(r'<(?:animate|set)\b.*?</(?:animate|set)>', '', s, flags=_re.DOTALL|_re.IGNORECASE)
+    # Neutralize javascript: URIs in href attributes (quoted and unquoted)
+    s = _re.sub(r'((?:xlink:)?href\s*=\s*["\']?)javascript:', r'\1#', s, flags=_re.IGNORECASE)
+    # Neutralize data: URIs in href/src (quoted and unquoted)
+    s = _re.sub(r'((?:xlink:)?href\s*=\s*["\']?)data:', r'\1#', s, flags=_re.IGNORECASE)
+    s = _re.sub(r'(src\s*=\s*["\']?)data:', r'\1#', s, flags=_re.IGNORECASE)
+    # Remove on* event handlers (quoted, single-quoted, and unquoted values)
     s = _re.sub(r'\bon\w+\s*=\s*(?:"[^"]*"|\'[^\']*\'|\S+)', '', s, flags=_re.IGNORECASE)
-    # Remove data: URIs in href/src (potential XSS vector)
-    s = _re.sub(r'((?:xlink:)?href\s*=\s*["\'])data:[^"\']*(["\'])', r'\1#\2', s, flags=_re.IGNORECASE)
-    s = _re.sub(r'(src\s*=\s*["\'])data:[^"\']*(["\'])', r'\1#\2', s, flags=_re.IGNORECASE)
     return s
 
 flamegraph_section = ''
@@ -3077,7 +3128,19 @@ cmd_ship() {
 
     local include_strace=false rsync_extra=()
     for arg in "$@"; do
-        [[ "$arg" == "--include-strace" ]] && include_strace=true || rsync_extra+=("$arg")
+        if [[ "$arg" == "--include-strace" ]]; then
+            include_strace=true
+        else
+            # Whitelist safe rsync args; reject dangerous flags
+            case "$arg" in
+                --checksum|--compress|-z|-c|--progress|--verbose|-v|--dry-run|-n)
+                    rsync_extra+=("$arg") ;;
+                --bwlimit=*|--timeout=*)
+                    rsync_extra+=("$arg") ;;
+                *)
+                    echo "[puppet-trace] ship: ignoring unrecognized/unsafe arg: $arg" >&2 ;;
+            esac
+        fi
     done
 
     local remote_host="${remote%%:*}"

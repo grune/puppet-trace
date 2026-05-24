@@ -82,12 +82,12 @@ def test_self_closing_script_stripped():
 
 
 def test_javascript_href_neutralized():
-    """xlink:href="javascript:alert(1)" is replaced with '#'."""
+    """xlink:href="javascript:alert(1)" has the javascript: scheme neutralized."""
     dirty = '<svg><a xlink:href="javascript:alert(1)">click</a></svg>'
     result = _sanitize_svg(dirty)
     assert 'javascript:' not in result.lower()
-    # href should now be '#'
-    assert 'href="#"' in result or "href='#'" in result
+    # href should start with '#' (scheme replaced; rest of value may remain)
+    assert 'href="#' in result or "href='#" in result
 
 
 def test_plain_href_javascript_neutralized():
@@ -181,3 +181,28 @@ def test_case_insensitive_script():
     result = _sanitize_svg(dirty)
     assert 'alert' not in result
     assert '<text>ok</text>' in result
+
+
+# ── N6/N7: unquoted href and animate/set elements ─────────────────────────────
+
+
+def test_unquoted_href_javascript_neutralized():
+    """href=javascript:alert(1) without quotes is neutralized."""
+    dirty = '<a href=javascript:alert(1)>click</a>'
+    result = _sanitize_svg(dirty)
+    assert 'javascript:' not in result.lower()
+    assert 'href=#' in result or 'href="' in result
+
+
+def test_animate_element_stripped():
+    """<animate> element that could animate href to javascript: is stripped."""
+    dirty = '<animate attributeName="href" to="javascript:alert(1)"/>'
+    result = _sanitize_svg(dirty)
+    assert 'animate' not in result.lower()
+
+
+def test_set_element_stripped():
+    """<set> element that could set href to javascript: is stripped."""
+    dirty = '<set attributeName="href" to="javascript:alert(1)"/>'
+    result = _sanitize_svg(dirty)
+    assert 'set attributeName' not in result
