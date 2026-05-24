@@ -16,6 +16,14 @@
 
 set -euo pipefail
 
+_validate_puppet_id() {
+    local val="$1" name="$2"
+    if [[ ! "$val" =~ ^[a-zA-Z0-9._:-]+$ ]]; then
+        echo "[puppet-trace] ERROR: $name contains invalid characters: '$val'" >&2
+        return 1
+    fi
+}
+
 export PATH="/opt/puppetlabs/bin:/opt/puppetlabs/puppet/bin:$PATH"
 
 ###############################################################################
@@ -132,7 +140,7 @@ cmd_collect() {
     local TIMESTAMP
     TIMESTAMP=$(date +%Y%m%d-%H%M%S)
     local OUTDIR="/var/log/puppet-trace/${TIMESTAMP}"
-    mkdir -p "$OUTDIR"
+    mkdir -m 0700 -p "$OUTDIR"
 
     local PUPPET_LOG="$OUTDIR/puppet.log"
     local PROFILE_LOG="$OUTDIR/puppetserver-profile.log"
@@ -168,7 +176,10 @@ cmd_collect() {
     local _ssh_user="${PUPPET_TRACE_SSH_USER:-puppet}"
     local _ssh_key="${PUPPET_TRACE_SSH_KEY:-${HOME}/.ssh/id_ed25519}"
     local _server_container="${PUPPET_TRACE_SERVER_CONTAINER:-puppetserver}"
-    local _ssh_c_opts=(-o ConnectTimeout=10 -o BatchMode=yes -o StrictHostKeyChecking=no)
+    _validate_puppet_id "${_server_container}" "PUPPET_TRACE_SERVER_CONTAINER" || return
+    _validate_puppet_id "${_ssh_user}" "PUPPET_TRACE_SSH_USER" || return
+    mkdir -m 0700 -p /var/log/puppet-trace/
+    local _ssh_c_opts=(-o ConnectTimeout=10 -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/var/log/puppet-trace/.ssh_known_hosts)
     [[ -f "$_ssh_key" ]] && _ssh_c_opts+=(-i "$_ssh_key")
 
     echo "[puppet-trace collect] fetching PROFILE entries from $puppet_server since ${since_arg:-last 5000 lines}..."
@@ -217,7 +228,7 @@ cmd_collect() {
     local RESOURCE_REPORT_JSON="$OUTDIR/resource-report.json"
     if [[ -f "$LAST_RUN_REPORT_YAML" ]]; then
         local _rb_collect
-        _rb_collect=$(mktemp /tmp/puppet-trace-collect.XXXXX.rb)
+        _rb_collect=$(mktemp "${OUTDIR}/puppet-trace-tmp.XXXXX.rb")
         cat > "$_rb_collect" << 'RUBYEOF_COLLECT'
 require 'yaml'; require 'json'
 report_path  = ARGV[0]
@@ -362,7 +373,7 @@ _generate_profile_flamegraph() {
     #   <ts> <level> [<thread>] [<javaclass>] Puppet PROFILE ...
     # Our puppetserver container omits [javaclass], so inject a placeholder.
     local normalized_log
-    normalized_log=$(mktemp /tmp/puppet-trace-profile.XXXXX.log)
+    normalized_log=$(mktemp "$(dirname "$svg_out")/puppet-trace-tmp.XXXXX.log")
     sed 's/ Puppet PROFILE/ [puppet.server] Puppet PROFILE/' \
         "$profile_log" > "$normalized_log"
     ruby "$parser" -f flamegraph "$normalized_log" \
@@ -509,9 +520,16 @@ for line in puppet_lines:
 resource_count = sum(1 for l in puppet_lines if re.search(r'^Notice: /Stage', l))
 
 # ── profile flamegraph ────────────────────────────────────────────────────────
+import re as _re
+def _sanitize_svg(s):
+    s = _re.sub(r'<script[^>]*>.*?</script>', '', s, flags=_re.DOTALL|_re.IGNORECASE)
+    s = _re.sub(r'\bon\w+\s*=', 'data-removed=', s, flags=_re.IGNORECASE)
+    return s
+
 if os.path.isfile(profile_flamegraph_svg) and os.path.getsize(profile_flamegraph_svg) > 0:
     with open(profile_flamegraph_svg) as f:
         profile_svg_content = f.read()
+    profile_svg_content = _sanitize_svg(profile_svg_content)
     profile_section = f'''
 <section id="profile-flamegraph">
   <h2>Profile Flamegraph (Catalog Compilation)</h2>
@@ -745,7 +763,7 @@ if [[ ${#PUPPET_CMD[@]} -eq 0 ]]; then
     PUPPET_CMD=(puppet agent --test --profile --evaltrace)
 fi
 
-[[ -z "${_LATE_SUBCMD:-}" ]] && mkdir -p "$OUTDIR"
+[[ -z "${_LATE_SUBCMD:-}" ]] && mkdir -m 0700 -p "$OUTDIR"
 PUPPET_LOG="$OUTDIR/puppet.log"
 STRACE_LOG="$OUTDIR/strace.log"
 INOTIFY_LOG="$OUTDIR/inotify.log"
@@ -1250,15 +1268,21 @@ run_puppet() {
         df -h 2>/dev/null || true
     } >"$OUTDIR/sysctx-before.txt" 2>/dev/null || true
 
+    local puppet_run_user="${PUPPET_TRACE_PUPPET_USER:-puppet}"
+    local run_as_user=()
+    if id "$puppet_run_user" &>/dev/null && [[ $EUID -eq 0 ]]; then
+        run_as_user=(sudo -u "$puppet_run_user" --)
+    fi
+
     if $HAS_STRACE && $IS_ROOT; then
         echo "[puppet-trace] running puppet under strace (full I/O correlation mode)"
         strace -f -ttt \
             -e trace=openat,open,read,write,execve,clone,exit_group,connect,sendto,recvfrom \
             -o "$STRACE_RAW" \
-            "${PUPPET_CMD[@]}" >"$PUPPET_LOG" 2>&1 &
+            "${run_as_user[@]}" "${PUPPET_CMD[@]}" >"$PUPPET_LOG" 2>&1 &
         PUPPET_PID=$!
     else
-        "${PUPPET_CMD[@]}" >"$PUPPET_LOG" 2>&1 &
+        "${run_as_user[@]}" "${PUPPET_CMD[@]}" >"$PUPPET_LOG" 2>&1 &
         PUPPET_PID=$!
     fi
 
@@ -1395,7 +1419,7 @@ parse_last_run_report() {
     # Python's yaml.safe_load chokes on !ruby/object tags in last_run_report.yaml.
     # Use puppet's bundled ruby + tag-stripping so Psych treats puppet objects as plain Hashes.
     local ruby_script
-    ruby_script=$(mktemp /tmp/puppet-trace-parser.XXXXX.rb)
+    ruby_script=$(mktemp "${OUTDIR}/puppet-trace-tmp.XXXXX.rb")
     cat > "$ruby_script" << 'RUBYEOF'
 require 'yaml'; require 'json'
 report_yaml = ARGV[0]
@@ -1494,7 +1518,16 @@ enrich_from_puppetdb() {
     ssh_user="${PUPPET_TRACE_SSH_USER:-puppet}"
     ssh_key="${PUPPET_TRACE_SSH_KEY:-${HOME}/.ssh/id_ed25519}"
     local _pdb_container="${PUPPET_TRACE_PDB_CONTAINER:-puppetdb}"
-    _ssh_opts=(-o ConnectTimeout=5 -o BatchMode=yes -o StrictHostKeyChecking=no)
+    _validate_puppet_id "${_pdb_container}" "PUPPET_TRACE_PDB_CONTAINER" || return
+    _validate_puppet_id "${ssh_user}" "PUPPET_TRACE_SSH_USER" || return
+    # Validate puppet identifiers before use in SSH commands
+    _validate_puppet_id "$certname" "certname" || return
+    [[ -n "$transaction_uuid" ]] && _validate_puppet_id "$transaction_uuid" "transaction_uuid" || transaction_uuid=""
+    local certname_enc transaction_uuid_enc
+    certname_enc=$(python3 -c "import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1]))" "$certname")
+    [[ -n "$transaction_uuid" ]] && transaction_uuid_enc=$(python3 -c "import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1]))" "$transaction_uuid") || transaction_uuid_enc=""
+    mkdir -m 0700 -p /var/log/puppet-trace/
+    _ssh_opts=(-o ConnectTimeout=5 -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/var/log/puppet-trace/.ssh_known_hosts)
     [[ -f "$ssh_key" ]] && _ssh_opts+=(-i "$ssh_key")
 
     echo "[puppet-trace] querying PuppetDB on $puppet_server for $certname..."
@@ -1502,7 +1535,7 @@ enrich_from_puppetdb() {
     local pdb_json
     pdb_json=$(ssh "${_ssh_opts[@]}" "${ssh_user}@${puppet_server}" \
         "docker exec ${_pdb_container} curl -sf \
-         'http://localhost:8080/pdb/query/v4/resources?query=%5B%22%3D%22%2C%22certname%22%2C%22${certname}%22%5D'" \
+         'http://localhost:8080/pdb/query/v4/resources?query=%5B%22%3D%22%2C%22certname%22%2C%22${certname_enc}%22%5D'" \
         2>/dev/null) || { echo "[puppet-trace] PuppetDB SSH query failed — using local data only" >&2; return; }
 
     local event_json=""
@@ -1510,8 +1543,11 @@ enrich_from_puppetdb() {
         local report_hash
         report_hash=$(ssh "${_ssh_opts[@]}" "${ssh_user}@${puppet_server}" \
             "docker exec ${_pdb_container} curl -sf \
-             'http://localhost:8080/pdb/query/v4/reports?query=%5B%22%3D%22%2C%22transaction_uuid%22%2C%22${transaction_uuid}%22%5D'" \
+             'http://localhost:8080/pdb/query/v4/reports?query=%5B%22%3D%22%2C%22transaction_uuid%22%2C%22${transaction_uuid_enc}%22%5D'" \
             2>/dev/null | python3 -c "import json,sys; d=json.load(sys.stdin); print(d[0]['hash'] if d else '')" 2>/dev/null || echo "")
+        if [[ -n "$report_hash" ]]; then
+            _validate_puppet_id "$report_hash" "report_hash" || report_hash=""
+        fi
         if [[ -n "$report_hash" ]]; then
             event_json=$(ssh "${_ssh_opts[@]}" "${ssh_user}@${puppet_server}" \
                 "docker exec ${_pdb_container} curl -sf \
@@ -2016,7 +2052,10 @@ collect_profile_flamegraph() {
     local _ssh_user2="${PUPPET_TRACE_SSH_USER:-puppet}"
     ssh_key="${PUPPET_TRACE_SSH_KEY:-${HOME}/.ssh/id_ed25519}"
     local _server_container2="${PUPPET_TRACE_SERVER_CONTAINER:-puppetserver}"
-    _ssh_opts=(-o ConnectTimeout=10 -o BatchMode=yes -o StrictHostKeyChecking=no)
+    _validate_puppet_id "${_server_container2}" "PUPPET_TRACE_SERVER_CONTAINER" || return
+    _validate_puppet_id "${_ssh_user2}" "PUPPET_TRACE_SSH_USER" || return
+    mkdir -m 0700 -p /var/log/puppet-trace/
+    _ssh_opts=(-o ConnectTimeout=10 -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/var/log/puppet-trace/.ssh_known_hosts)
     [[ -f "$ssh_key" ]] && _ssh_opts+=(-i "$ssh_key")
 
     echo "[puppet-trace] fetching PROFILE entries from puppetserver (${puppet_server}) docker logs since ${start_iso}..."
@@ -2450,10 +2489,18 @@ def make_bar_chart(step_list, wall_total, width=700):
     svg.append('</svg>')
     return '\n'.join(svg)
 
+import re as _re
+import html as _html_mod
+def _sanitize_svg(s):
+    s = _re.sub(r'<script[^>]*>.*?</script>', '', s, flags=_re.DOTALL|_re.IGNORECASE)
+    s = _re.sub(r'\bon\w+\s*=', 'data-removed=', s, flags=_re.IGNORECASE)
+    return s
+
 flamegraph_section = ''
 if os.path.isfile(flamegraph_svg) and os.path.getsize(flamegraph_svg) > 0:
     with open(flamegraph_svg) as f:
         svg_content = f.read()
+    svg_content = _sanitize_svg(svg_content)
     flamegraph_section = f'<section id="flamegraph"><h2>Flamegraph / Stack Summary</h2><div class="flamegraph-wrap">{svg_content}</div></section>'
 else:
     flamegraph_section = '<section id="flamegraph"><h2>Flamegraph / Stack Summary</h2><div class="chart-empty">Not available (requires perf + flamegraph.pl as root, or /proc/PID/stack samples).</div></section>'
@@ -2462,13 +2509,14 @@ profile_flamegraph_section = ''
 if profile_flamegraph_svg and os.path.isfile(profile_flamegraph_svg) and os.path.getsize(profile_flamegraph_svg) > 0:
     with open(profile_flamegraph_svg) as f:
         profile_svg_content = f.read()
+    profile_svg_content = _sanitize_svg(profile_svg_content)
     profile_flamegraph_section = f'<section id="profile-flamegraph"><h2>Profile Flamegraph (Catalog Compilation)</h2><p style="font-size:0.85em;color:#666;margin-bottom:8px;">Generated from puppetserver PROFILE log entries via puppet-profile-parser + flamegraph.pl. Click to zoom.</p><div class="flamegraph-wrap">{profile_svg_content}</div></section>'
 else:
     profile_html_fallback = profile_flamegraph_svg.replace('.svg', '.html') if profile_flamegraph_svg else ''
     fallback_msg = 'Not available — no PROFILE entries captured. Ensure puppetserver is reachable via SSH and received the --profile flag.'
     if profile_html_fallback and os.path.isfile(profile_html_fallback):
         with open(profile_html_fallback) as f:
-            fallback_msg = f.read()
+            fallback_msg = _html_mod.escape(f.read())
     profile_flamegraph_section = f'<section id="profile-flamegraph"><h2>Profile Flamegraph (Catalog Compilation)</h2><div class="chart-empty">{fallback_msg}</div></section>'
 
 puppet_log_html = html.escape(''.join(puppet_lines)) if puppet_lines else '(empty)'
@@ -2916,7 +2964,7 @@ cmd_report() {
     IO_CORR_JSON="$outdir/io-correlation.json"
     IDEMPOTENCY_STDOUT="$outdir/idempotency.stdout"
     REPORT_HTML="$outdir/report.html"
-    PUPPET_CMD=($PUPPET_CMD_META)
+    read -r -a PUPPET_CMD <<< "$PUPPET_CMD_META"
 
     if [[ ! -s "$PROFILE_FLAMEGRAPH_SVG" ]] && [[ -s "$PROFILE_LOG" ]]; then
         echo "[puppet-trace report] profile.log present but flamegraph SVG missing — regenerating..."
@@ -2966,7 +3014,7 @@ cmd_ship() {
     echo "[puppet-trace ship] $outdir → $remote (${exclude_args[*]:-no exclusions})"
     rsync -av --progress "${exclude_args[@]}" "${rsync_extra[@]}" "$outdir/" "${remote}/"
     echo "[puppet-trace ship] synced — running report on $remote_host..."
-    ssh "$remote_host" "puppet-trace report '${remote_path}'"
+    ssh "$remote_host" puppet-trace report -- "$remote_path"
     echo "[puppet-trace ship] done — report at $remote_host:${remote_path}/report.html"
 }
 

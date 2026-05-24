@@ -1,0 +1,68 @@
+# puppet-trace sudoers — minimal privilege grant
+# Install: visudo -f /etc/sudoers.d/puppet-trace
+#
+# Grants a dedicated operator account root access ONLY for the specific
+# binaries puppet-trace needs. Adjust %puppet-trace-ops to the actual
+# group or user on your system.
+#
+# Prerequisites:
+#   - puppet-trace temp files must go to /var/log/puppet-trace/ (not /tmp)
+#     — this is the default since v0.2; set LOG_DIR in /etc/puppet-trace.conf
+#   - puppet user must exist for H1 mitigation (puppet agent drops privs)
+#   - perf_event_paranoid must allow perf: echo -1 > /proc/sys/kernel/perf_event_paranoid
+#
+# Usage: sudo puppet-trace once [args]
+#        sudo puppet-trace enable / disable
+
+Defaults:%puppet-trace-ops !requiretty
+
+# strace: wrap puppet process — output must land in log dir
+Cmnd_Alias PT_STRACE = \
+    /usr/bin/strace -f -ttt -e trace\=* -o /var/log/puppet-trace/*
+
+# perf: attach to puppet PID — output must land in log dir
+Cmnd_Alias PT_PERF = \
+    /usr/bin/perf record -g -p [0-9]* -o /var/log/puppet-trace/*
+
+# pmap: memory map snapshot of puppet PID
+Cmnd_Alias PT_PMAP = \
+    /usr/bin/pmap -x [0-9]*
+
+# puppet agent: must run as puppet user via run_as_user=(sudo -u puppet)
+# The script invokes: sudo -u puppet -- /opt/puppetlabs/bin/puppet agent ...
+# Grant puppet-trace-ops to sudo as puppet for the agent binary
+Cmnd_Alias PT_PUPPET_AGENT = \
+    /opt/puppetlabs/bin/puppet agent --test --profile --evaltrace, \
+    /opt/puppetlabs/bin/puppet agent --test --noop, \
+    /opt/puppetlabs/bin/puppet agent --test
+
+# puppet apply: for local manifest runs
+Cmnd_Alias PT_PUPPET_APPLY = \
+    /opt/puppetlabs/bin/puppet apply *
+
+# puppet service control: stop/start agent daemon during profiling window
+Cmnd_Alias PT_PUPPET_SVC = \
+    /bin/systemctl stop puppet, \
+    /bin/systemctl start puppet, \
+    /bin/systemctl is-active puppet, \
+    /usr/bin/systemctl stop puppet, \
+    /usr/bin/systemctl start puppet, \
+    /usr/bin/systemctl is-active puppet
+
+# Grant to the ops group (root → run strace/perf/pmap/service ops)
+%puppet-trace-ops ALL=(root) NOPASSWD: PT_STRACE, PT_PERF, PT_PMAP, PT_PUPPET_SVC
+
+# Grant puppet agent/apply to run AS puppet user (not root)
+%puppet-trace-ops ALL=(puppet) NOPASSWD: PT_PUPPET_AGENT, PT_PUPPET_APPLY
+
+# --- NOTES ---
+# 1. PT_STRACE uses a wildcard on -e trace= because the trace filter string
+#    contains commas which sudoers cannot match without a wildcard. Tighten
+#    by wrapping strace in a helper script and granting only that script.
+# 2. PT_PMAP uses a PID wildcard — unavoidable without a wrapper.
+# 3. journalctl, df, ss, pgrep, inotifywait do NOT require root; omitted.
+# 4. The ruby temp scripts (collect/parse) are now written to /var/log/puppet-trace/
+#    (root-owned, mode 0700) and executed by the puppet ruby runtime. No separate
+#    sudoers entry needed — the outdir is already root-controlled.
+# 5. For non-docker PuppetDB/puppetserver setups, the SSH exec commands run
+#    under the ssh_user account on the remote host. No local sudo needed for those.
