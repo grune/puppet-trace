@@ -1681,7 +1681,9 @@ GCEOF
         fi
     fi
 
-    "${run_as_user[@]}" "${PUPPET_CMD[@]}" >"$PUPPET_LOG" 2>&1 &
+    local _ts_log="$OUTDIR/puppet-timestamps.log"
+    "${run_as_user[@]}" "${PUPPET_CMD[@]}" \
+        --logdest "$_ts_log" --logdest console >"$PUPPET_LOG" 2>&1 &
     PUPPET_PID=$!
 
     # Feature 3: cgroup v2 accounting — snapshot at run start
@@ -1837,7 +1839,16 @@ GCEOF
     [[ -n "${IO_POLLER_PID:-}" ]]   && kill "$IO_POLLER_PID"   2>/dev/null || true
     [[ -n "${STRACE_PID:-}" ]]       && kill "$STRACE_PID"       2>/dev/null || true
     [[ -n "${PERF_PID:-}" ]]         && kill "$PERF_PID"         2>/dev/null || true
-    [[ -n "${RBSPY_PID:-}" ]]        && kill "$RBSPY_PID"        2>/dev/null || true
+    # rbspy only writes the flamegraph SVG on SIGINT (Ctrl-C path), not SIGTERM.
+    # Send INT first, wait up to 10s for it to flush and exit, then KILL if stuck.
+    if [[ -n "${RBSPY_PID:-}" ]]; then
+        kill -INT "$RBSPY_PID" 2>/dev/null || true
+        for _i in $(seq 1 10); do
+            kill -0 "$RBSPY_PID" 2>/dev/null || break
+            sleep 1
+        done
+        kill -KILL "$RBSPY_PID" 2>/dev/null || true
+    fi
     wait 2>/dev/null || true
 
     # Snapshot /proc/meminfo + df after run
@@ -2586,40 +2597,58 @@ def count_augeas_lenses(events_for_window):
     return sum(1 for e in events_for_window
                if '/augeas/lenses/' in e.get('path', '') or '/usr/share/augeas/' in e.get('path', ''))
 
-# ── Feature 7: HTTP phase decomposition from strace sendto/write buffers ──────
-def parse_http_phases(strace_events_list, run_start_ts):
-    """Extract HTTP phase timing from strace sendto/write buffers."""
-    phases = []
-    http_verb_re = re.compile(r'(GET|POST|PUT|DELETE)\s+(/puppet/v3/\S+)\s+HTTP')
-    ts_re = re.compile(r'^(\d+\.\d+)')
+# ── Feature 7: HTTP phase decomposition from puppet-timestamps.log ────────────
+def parse_http_phases_from_log(ts_log_path, run_start_wall):
+    """Extract puppet run phases from --logdest timestamped log.
 
-    for ev in strace_events_list:
-        if ev['syscall'] not in ('sendto', 'write'):
-            continue
-        path = ev.get('path', '')
-        # strace with -s 0 captures full payload in path field for sendto
-        hm = http_verb_re.search(path)
-        if not hm:
-            continue
-        verb = hm.group(1)
-        url_path = hm.group(2)
-        ts = ev['ts']
-        if '/node' in url_path:
-            phase = 'node_classify'
-        elif '/catalog' in url_path and verb == 'POST':
-            phase = 'catalog_request'
-        elif '/file_metadata' in url_path or '/file_content' in url_path:
-            phase = 'file_resource'
-        elif '/report' in url_path and verb == 'PUT':
-            phase = 'report_submit'
-        elif '/facts' in url_path:
-            phase = 'facts_upload'
-        else:
-            phase = 'other_http'
-        phases.append({'ts': ts - run_start_ts, 'phase': phase, 'verb': verb, 'path': url_path})
+    puppet-timestamps.log format (written by --logdest FILE):
+      2026-05-25 10:13:39 -0600 Puppet (info): Retrieving pluginfacts
+    """
+    phases = []
+    if not ts_log_path or not os.path.isfile(ts_log_path):
+        return phases
+
+    # Ordered phase markers: (regex, phase_name, verb, path_label)
+    MARKERS = [
+        (re.compile(r'Retrieving pluginfacts'),          'facts_prefetch',    'GET',  '/puppet/v3/file_metadatas/pluginfacts'),
+        (re.compile(r'Retrieving plugin\b'),             'plugin_sync',       'GET',  '/puppet/v3/file_metadatas/plugins'),
+        (re.compile(r'Loading facts'),                   'facts_load',        '',     '(facter)'),
+        (re.compile(r'Requesting catalog from'),         'catalog_request',   'POST', '/puppet/v3/catalog'),
+        (re.compile(r'Catalog compiled by'),             'catalog_compile',   '',     '(server-side)'),
+        (re.compile(r'Caching catalog'),                 'catalog_cache',     '',     '(local)'),
+        (re.compile(r'Applying configuration'),          'catalog_apply',     '',     '(apply)'),
+        (re.compile(r'Applied catalog in'),              'apply_complete',    '',     '(done)'),
+    ]
+    # Timestamp formats puppet uses in --logdest FILE
+    ts_re = re.compile(r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s+[+-]\d{4}')
+
+    import datetime
+    try:
+        with open(ts_log_path, errors='replace') as f:
+            for line in f:
+                tm = ts_re.match(line)
+                if not tm:
+                    continue
+                try:
+                    dt = datetime.datetime.strptime(tm.group(1), '%Y-%m-%d %H:%M:%S')
+                    ts = dt.timestamp()
+                except ValueError:
+                    continue
+                for pat, phase, verb, pth in MARKERS:
+                    if pat.search(line):
+                        phases.append({
+                            'ts':    ts - run_start_wall,
+                            'phase': phase,
+                            'verb':  verb,
+                            'path':  pth,
+                        })
+                        break
+    except OSError:
+        pass
     return phases
 
-http_phases = parse_http_phases(strace_events, min_ts)
+ts_log_path = os.path.join(os.path.dirname(strace_raw), 'puppet-timestamps.log')
+http_phases = parse_http_phases_from_log(ts_log_path, min_ts)
 print(f"[corr] HTTP phases detected: {len(http_phases)}")
 
 # Augeas + re-correlate to add augeas_lens_count per resource
