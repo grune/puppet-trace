@@ -1,0 +1,2406 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>puppet-trace — forge — 2026-05-25 10:05:42</title>
+<style>
+  :root {
+    --bg: #f5f7fa; --card: #fff; --border: #dce1e9; --accent: #4a90d9;
+    --red: #e84040; --green: #27ae60; --mono: "JetBrains Mono","Fira Mono",monospace;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: system-ui, sans-serif; background: var(--bg); color: #222; font-size: 14px; }
+  header { background: #1a2035; color: #fff; padding: 16px 24px; }
+  header h1 { font-size: 1.3em; margin-bottom: 4px; }
+  header .meta { font-size: 0.85em; opacity: 0.75; font-family: var(--mono); }
+  .status-ok   { color: #4cee8c; font-weight: bold; }
+  .status-fail { color: #ff6b6b; font-weight: bold; }
+  main { max-width: 1100px; margin: 0 auto; padding: 20px; }
+  section { background: var(--card); border: 1px solid var(--border); border-radius: 6px;
+             padding: 16px 20px; margin-bottom: 20px; }
+  h2 { font-size: 1em; color: var(--accent); text-transform: uppercase; letter-spacing: 0.05em;
+        margin-bottom: 12px; border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { padding: 6px 10px; border: 1px solid var(--border); text-align: left; font-size: 13px; }
+  th { background: var(--bg); font-weight: 600; }
+  tr.slow td { background: #fff4f4; color: var(--red); font-weight: bold; }
+  .summary-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; }
+  .stat-card { background: var(--bg); border: 1px solid var(--border); border-radius: 4px;
+                padding: 12px; text-align: center; }
+  .stat-card .value { font-size: 1.6em; font-weight: bold; color: var(--accent); }
+  .stat-card .label { font-size: 0.8em; color: #666; margin-top: 4px; }
+  .chart-empty { color: #888; font-style: italic; padding: 10px 0; }
+  .flamegraph-wrap { overflow-x: auto; }
+  pre { font-family: var(--mono); font-size: 12px; white-space: pre-wrap; word-break: break-all;
+         background: #1a2035; color: #c0d0e8; padding: 12px; border-radius: 4px;
+         max-height: 400px; overflow-y: auto; }
+  details summary { cursor: pointer; padding: 4px 0; font-weight: bold; color: var(--accent); }
+  .ok   { color: var(--green); }
+  .fail { color: var(--red); }
+  .idem-pass { color: var(--green); font-weight: bold; font-size: 1.4em; }
+  .idem-fail { color: var(--red);   font-weight: bold; font-size: 1.4em; }
+  .idem-unk  { color: #888;         font-weight: bold; font-size: 1.4em; }
+  #res-table th { cursor: pointer; user-select: none; }
+  #res-table th:hover { background: #dce1f4; }
+  tr[id$="-detail"] td { border-top: none; }
+</style>
+<script>
+function toggleDetail(id) {
+  var el = document.getElementById(id + '-detail');
+  if (el) el.style.display = el.style.display === 'none' ? 'table-row' : 'none';
+}
+function sortTable(n) {
+  var tbl = document.getElementById('res-table');
+  var rows = Array.from(tbl.querySelectorAll('tbody tr:not([id$="-detail"])'));
+  var dir = tbl.dataset.sortDir === 'asc' ? 'desc' : 'asc';
+  tbl.dataset.sortDir = dir;
+  rows.sort(function(a,b) {
+    var av = a.cells[n].innerText.trim();
+    var bv = b.cells[n].innerText.trim();
+    var an = parseFloat(av); var bn = parseFloat(bv);
+    if (!isNaN(an) && !isNaN(bn)) return dir==='asc' ? an-bn : bn-an;
+    return dir==='asc' ? av.localeCompare(bv) : bv.localeCompare(av);
+  });
+  var tbody = tbl.querySelector('tbody');
+  rows.forEach(function(r) {
+    tbody.appendChild(r);
+    var det = document.getElementById(r.onclick.toString().match(/'([^']+)'/)[1]+'-detail');
+    if (det) tbody.appendChild(det);
+  });
+}
+
+// Flamegraph zoom + search
+function initFlamegraph(sectionId) {
+  var section = document.getElementById(sectionId);
+  if (!section) return;
+  var svg = section.querySelector('svg');
+  if (!svg) return;
+  var origFills = new Map();
+  var groups = Array.from(svg.querySelectorAll('#frames > g, #frames g > g, g[id] > g'));
+  groups.forEach(function(g) {
+    var rect = g.querySelector('rect');
+    if (rect) origFills.set(rect, rect.getAttribute('fill'));
+    g.style.cursor = 'pointer';
+  });
+  section._origFills = origFills;
+  section._svgGroups = groups;
+  section._fgScale = 1;
+  var wrap = section.querySelector('.flamegraph-wrap');
+  if (wrap) {
+    wrap.addEventListener('wheel', function(e) {
+      e.preventDefault();
+      section._fgScale = Math.max(0.5, Math.min(8, section._fgScale * (e.deltaY < 0 ? 1.15 : 0.87)));
+      svg.style.transform = 'scale(' + section._fgScale + ')';
+      svg.style.transformOrigin = 'top left';
+    }, {passive: false});
+  }
+}
+
+function flamegraphResetZoom(sectionId) {
+  var section = document.getElementById(sectionId);
+  if (!section) return;
+  var svg = section.querySelector('svg');
+  if (!svg) return;
+  section._fgScale = 1;
+  svg.style.transform = 'scale(1)';
+}
+
+function flamegraphSearch(sectionId, term) {
+  var section = document.getElementById(sectionId);
+  if (!section) return;
+  var lterm = term.toLowerCase();
+  var matched = 0;
+  if (!section._svgGroups) return;
+  section._svgGroups.forEach(function(g) {
+    var rect = g.querySelector('rect');
+    var title = g.querySelector('title');
+    if (!rect) return;
+    if (!term) {
+      rect.setAttribute('fill', section._origFills.get(rect) || rect.getAttribute('fill'));
+      return;
+    }
+    var match = title && title.textContent.toLowerCase().includes(lterm);
+    if (match) { matched++; rect.setAttribute('fill', '#ff8c00'); }
+    else rect.setAttribute('fill', section._origFills.get(rect) || '#ccc');
+  });
+  var info = document.getElementById(sectionId + '-search-info');
+  if (info) info.textContent = term ? matched + ' matched' : '';
+}
+
+window.addEventListener('load', function() {
+  initFlamegraph('flamegraph');
+  initFlamegraph('profile-flamegraph');
+  initFlamegraph('rbspy-flamegraph');
+});
+</script>
+</head>
+<body>
+<header>
+  <h1>puppet-trace report
+    <span class="status-ok">
+      &#10003; exit 0
+    </span>
+  </h1>
+  <div class="meta">
+    Host: forge &nbsp;|&nbsp;
+    Date: 2026-05-25 10:05:42 &nbsp;|&nbsp;
+    Puppet: 8.10.0 (fixture) &nbsp;|&nbsp;
+    UUID: fixture-puppet-apply-demo &nbsp;|&nbsp;
+    Command: <code>puppet apply /tmp/site.pp --evaltrace</code> &nbsp;|&nbsp;
+    Wall time: 18s
+  </div>
+</header>
+
+<main>
+
+<section id="summary">
+  <h2>Summary</h2>
+  <div class="summary-grid">
+    <div class="stat-card"><div class="value">18s</div><div class="label">Wall time</div></div>
+    <div class="stat-card"><div class="value">191MB</div><div class="label">Peak RSS</div></div>
+    <div class="stat-card"><div class="value">148MB</div><div class="label">Avg RSS</div></div>
+    <div class="stat-card"><div class="value">92MB</div><div class="label">Min RSS</div></div>
+    <div class="stat-card"><div class="value">120.0%</div><div class="label">Avg CPU</div></div>
+    <div class="stat-card"><div class="value">7</div><div class="label">Resources changed</div></div>
+    <div class="stat-card"><div class="value">0</div><div class="label">Resources failed</div></div>
+    <div class="stat-card"><div class="value">0</div><div class="label">Resources skipped</div></div>
+    <div class="stat-card"><div class="value">10</div><div class="label">Resources total</div></div>
+    <div class="stat-card" style="opacity:0.4"><div class="value">—</div><div class="label">PuppetDB</div></div>
+    <div class="stat-card"><div class="value">311.0 MB</div><div class="label">Total disk written</div></div>
+    <div class="stat-card"><div class="value">307</div><div class="label">strace events</div></div>
+    <div class="stat-card"><div class="value" style="color:#27ae60">PASS</div><div class="label">Idempotency</div></div>
+    <div class="stat-card"><div class="value">0</div><div class="label">Net connections</div></div>
+    <div class="stat-card"><div class="value">4</div><div class="label">Steps traced</div></div>
+  </div>
+</section>
+
+<section id="timing">
+  <h2>Step Timing</h2>
+  <svg xmlns="http://www.w3.org/2000/svg" width="700" height="178" style="background:#fff;border:1px solid #e0e0e0;border-radius:4px">
+<text x="350" y="16" text-anchor="middle" font-family="monospace" font-size="12" font-weight="bold">Puppet Steps by Duration</text>
+<text x="154" y="48" text-anchor="end" font-family="monospace" font-size="11">Load facts</text>
+<rect x="160" y="32" width="0" height="24" fill="#4a90d9" rx="2"/>
+<text x="164" y="48" font-family="monospace" font-size="10">0.00s</text>
+<text x="154" y="80" text-anchor="end" font-family="monospace" font-size="11">Compile catalog</text>
+<rect x="160" y="64" width="101" height="24" fill="#4a90d9" rx="2"/>
+<text x="265" y="80" font-family="monospace" font-size="10">4.12s</text>
+<text x="154" y="112" text-anchor="end" font-family="monospace" font-size="11">Apply catalog</text>
+<rect x="160" y="96" width="0" height="24" fill="#4a90d9" rx="2"/>
+<text x="164" y="112" font-family="monospace" font-size="10">0.00s</text>
+<text x="154" y="144" text-anchor="end" font-family="monospace" font-size="11">Apply complete</text>
+<rect x="160" y="128" width="460" height="24" fill="#e84040" rx="2"/>
+<text x="624" y="144" font-family="monospace" font-size="10">18.74s</text>
+</svg>
+</section>
+
+<section id="memory">
+  <h2>Memory (RSS)</h2>
+  <svg xmlns="http://www.w3.org/2000/svg" width="900" height="300" style="background:#fff;border:1px solid #e0e0e0;border-radius:4px;display:block">
+<text x="472" y="20" text-anchor="middle" font-family="monospace" font-size="12" font-weight="bold">Memory RSS over time (per-resource eval bands)</text>
+<line x1="65" y1="36" x2="65" y2="264" stroke="#bbb" stroke-width="1"/>
+<line x1="65" y1="264" x2="880" y2="264" stroke="#bbb" stroke-width="1"/>
+<line x1="61" y1="264.0" x2="65" y2="264.0" stroke="#888" stroke-width="1"/>
+<text x="59" y="268.0" text-anchor="end" font-family="monospace" font-size="10">92MB</text>
+<line x1="61" y1="150.0" x2="65" y2="150.0" stroke="#888" stroke-width="1"/>
+<text x="59" y="154.0" text-anchor="end" font-family="monospace" font-size="10">142MB</text>
+<line x1="61" y1="36.0" x2="65" y2="36.0" stroke="#888" stroke-width="1"/>
+<text x="59" y="40.0" text-anchor="end" font-family="monospace" font-size="10">191MB</text>
+<line x1="65.0" y1="264" x2="65.0" y2="268" stroke="#888" stroke-width="1"/>
+<text x="65.0" y="278" text-anchor="middle" font-family="monospace" font-size="10">0s</text>
+<line x1="268.8" y1="264" x2="268.8" y2="268" stroke="#888" stroke-width="1"/>
+<text x="268.8" y="278" text-anchor="middle" font-family="monospace" font-size="10">10s</text>
+<line x1="472.5" y1="264" x2="472.5" y2="268" stroke="#888" stroke-width="1"/>
+<text x="472.5" y="278" text-anchor="middle" font-family="monospace" font-size="10">20s</text>
+<line x1="676.2" y1="264" x2="676.2" y2="268" stroke="#888" stroke-width="1"/>
+<text x="676.2" y="278" text-anchor="middle" font-family="monospace" font-size="10">29s</text>
+<line x1="880.0" y1="264" x2="880.0" y2="268" stroke="#888" stroke-width="1"/>
+<text x="880.0" y="278" text-anchor="middle" font-family="monospace" font-size="10">39s</text>
+<rect x="325.0" y="36" width="101.8" height="228" fill="rgba(39,174,96,0.18)" stroke="none"><title>Package[docker-ce] (4.870s)</title></rect>
+<rect x="204.8" y="36" width="67.1" height="228" fill="rgba(39,174,96,0.18)" stroke="none"><title>Package[prometheus-node-exporter] (3.210s)</title></rect>
+<rect x="90.1" y="36" width="48.9" height="228" fill="rgba(39,174,96,0.18)" stroke="none"><title>Package[nginx] (2.340s)</title></rect>
+<rect x="141.1" y="36" width="39.1" height="228" fill="rgba(39,174,96,0.18)" stroke="none"><title>Package[vim] (1.870s)</title></rect>
+<rect x="68.8" y="36" width="19.9" height="228" fill="rgba(39,174,96,0.18)" stroke="none"><title>Service[sshd] (0.950s)</title></rect>
+<rect x="307.2" y="36" width="17.6" height="228" fill="rgba(39,174,96,0.18)" stroke="none"><title>Exec[update-ca-certificates] (0.840s)</title></rect>
+<rect x="426.9" y="36" width="14.0" height="228" fill="rgba(39,174,96,0.18)" stroke="none"><title>Service[docker] (0.670s)</title></rect>
+<rect x="272.1" y="36" width="11.5" height="228" fill="rgba(180,180,180,0.08)" stroke="none"><title>Service[prometheus-node-exporter] (0.550s)</title></rect>
+<rect x="180.4" y="36" width="9.4" height="228" fill="rgba(39,174,96,0.18)" stroke="none"><title>Service[nginx] (0.450s)</title></rect>
+<rect x="286.9" y="36" width="8.6" height="228" fill="rgba(180,180,180,0.08)" stroke="none"><title>Service[rsyslog] (0.410s)</title></rect>
+<rect x="444.1" y="36" width="7.9" height="228" fill="rgba(180,180,180,0.08)" stroke="none"><title>Service[chronyd] (0.380s)</title></rect>
+<rect x="460.0" y="36" width="6.5" height="228" fill="rgba(180,180,180,0.08)" stroke="none"><title>Service[auditd] (0.310s)</title></rect>
+<rect x="199.2" y="36" width="4.6" height="228" fill="rgba(39,174,96,0.18)" stroke="none"><title>Exec[sysctl -p] (0.220s)</title></rect>
+<rect x="452.9" y="36" width="4.6" height="228" fill="rgba(180,180,180,0.08)" stroke="none"><title>Service[apparmor] (0.220s)</title></rect>
+<rect x="297.4" y="36" width="3.8" height="228" fill="rgba(180,180,180,0.08)" stroke="none"><title>Exec[iptables-restore] (0.180s)</title></rect>
+<rect x="193.1" y="36" width="2.9" height="228" fill="rgba(39,174,96,0.18)" stroke="none"><title>User[deploy] (0.140s)</title></rect>
+<rect x="65.0" y="36" width="2.5" height="228" fill="rgba(39,174,96,0.18)" stroke="none"><title>File[/etc/ssh/sshd_config] (0.120s)</title></rect>
+<rect x="303.4" y="36" width="2.3" height="228" fill="rgba(180,180,180,0.08)" stroke="none"><title>File[/etc/ssl/certs/example.crt] (0.110s)</title></rect>
+<rect x="301.3" y="36" width="1.9" height="228" fill="rgba(39,174,96,0.18)" stroke="none"><title>File[/etc/iptables/rules.v4] (0.090s)</title></rect>
+<rect x="190.0" y="36" width="1.7" height="228" fill="rgba(39,174,96,0.18)" stroke="none"><title>File[/etc/nginx/nginx.conf] (0.080s)</title></rect>
+<rect x="196.2" y="36" width="1.7" height="228" fill="rgba(180,180,180,0.08)" stroke="none"><title>Group[deploy] (0.080s)</title></rect>
+<rect x="295.7" y="36" width="1.5" height="228" fill="rgba(39,174,96,0.18)" stroke="none"><title>Cron[backup-daily] (0.070s)</title></rect>
+<rect x="458.3" y="36" width="1.5" height="228" fill="rgba(39,174,96,0.18)" stroke="none"><title>File[/etc/audit/audit.rules] (0.070s)</title></rect>
+<rect x="285.5" y="36" width="1.5" height="228" fill="rgba(39,174,96,0.18)" stroke="none"><title>File[/etc/rsyslog.conf] (0.060s)</title></rect>
+<rect x="440.9" y="36" width="1.5" height="228" fill="rgba(39,174,96,0.18)" stroke="none"><title>File[/etc/docker/daemon.json] (0.060s)</title></rect>
+<rect x="191.8" y="36" width="1.5" height="228" fill="rgba(180,180,180,0.08)" stroke="none"><title>File[/etc/nginx/sites-enabled/default] (0.050s)</title></rect>
+<rect x="305.9" y="36" width="1.5" height="228" fill="rgba(180,180,180,0.08)" stroke="none"><title>File[/etc/ssl/private/example.key] (0.050s)</title></rect>
+<rect x="198.1" y="36" width="1.5" height="228" fill="rgba(180,180,180,0.08)" stroke="none"><title>File[/etc/security/limits.conf] (0.040s)</title></rect>
+<rect x="283.8" y="36" width="1.5" height="228" fill="rgba(180,180,180,0.08)" stroke="none"><title>File[/etc/default/prometheus-node-exporter] (0.040s)</title></rect>
+<rect x="443.0" y="36" width="1.5" height="228" fill="rgba(39,174,96,0.18)" stroke="none"><title>File[/etc/chrony.conf] (0.040s)</title></rect>
+<rect x="67.9" y="36" width="1.5" height="228" fill="rgba(39,174,96,0.18)" stroke="none"><title>File[/etc/motd] (0.030s)</title></rect>
+<rect x="204.0" y="36" width="1.5" height="228" fill="rgba(39,174,96,0.18)" stroke="none"><title>File[/etc/sysctl.d/99-custom.conf] (0.030s)</title></rect>
+<rect x="139.2" y="36" width="1.5" height="228" fill="rgba(180,180,180,0.08)" stroke="none"><title>Package[curl] (0.020s)</title></rect>
+<rect x="139.8" y="36" width="1.5" height="228" fill="rgba(180,180,180,0.08)" stroke="none"><title>Package[wget] (0.020s)</title></rect>
+<rect x="140.4" y="36" width="1.5" height="228" fill="rgba(180,180,180,0.08)" stroke="none"><title>Package[git] (0.020s)</title></rect>
+<rect x="284.8" y="36" width="1.5" height="228" fill="rgba(180,180,180,0.08)" stroke="none"><title>Package[rsyslog] (0.020s)</title></rect>
+<rect x="442.4" y="36" width="1.5" height="228" fill="rgba(180,180,180,0.08)" stroke="none"><title>Package[chrony] (0.020s)</title></rect>
+<rect x="452.2" y="36" width="1.5" height="228" fill="rgba(180,180,180,0.08)" stroke="none"><title>Package[apparmor] (0.020s)</title></rect>
+<rect x="457.7" y="36" width="1.5" height="228" fill="rgba(180,180,180,0.08)" stroke="none"><title>Package[auditd] (0.020s)</title></rect>
+<rect x="466.6" y="36" width="1.5" height="228" fill="rgba(180,180,180,0.08)" stroke="none"><title>Class[Main] (0.000s)</title></rect>
+<line x1="65" y1="36.0" x2="880" y2="36.0" stroke="#e84040" stroke-width="1" stroke-dasharray="4,2" opacity="0.7"/>
+<text x="878" y="33.0" text-anchor="end" font-family="monospace" font-size="9" fill="#e84040">peak 191MB</text>
+<line x1="65" y1="135.6" x2="880" y2="135.6" stroke="#888" stroke-width="1" stroke-dasharray="2,2" opacity="0.7"/>
+<text x="878" y="132.6" text-anchor="end" font-family="monospace" font-size="9" fill="#888">avg 148.0MB</text>
+<line x1="65" y1="264.0" x2="880" y2="264.0" stroke="#4a90d9" stroke-width="1" stroke-dasharray="4,2" opacity="0.7"/>
+<text x="878" y="261.0" text-anchor="end" font-family="monospace" font-size="9" fill="#4a90d9">min 92MB</text>
+<polyline points="65.0,264.0 85.9,262.3 106.8,261.3 127.7,261.7 148.6,263.1 169.5,242.4 190.4,221.3 211.3,221.6 232.2,220.6 253.1,218.9 274.0,200.3 294.9,182.5 315.8,182.8 336.7,184.3 357.6,186.1 378.5,168.7 399.4,150.2 420.3,130.5 441.2,128.7 462.1,127.0 482.9,126.1 503.8,126.5 524.7,128.0 545.6,111.8 566.5,95.2 587.4,77.4 608.3,58.3 629.2,38.5 650.1,36.8 671.0,36.0 691.9,36.4 712.8,40.7 733.7,45.4 754.6,49.6 775.5,52.6 796.4,54.4 817.3,55.4 838.2,56.5 859.1,58.5 880.0,61.8" fill="none" stroke="#4a90d9" stroke-width="2.5" stroke-linejoin="round"/>
+<circle cx="65.0" cy="264.0" r="2.5" fill="#4a90d9" opacity="0.7"><title>92MB @ t=0s</title></circle>
+<circle cx="85.9" cy="262.3" r="2.5" fill="#4a90d9" opacity="0.7"><title>93MB @ t=1s</title></circle>
+<circle cx="106.8" cy="261.3" r="2.5" fill="#4a90d9" opacity="0.7"><title>93MB @ t=2s</title></circle>
+<circle cx="127.7" cy="261.7" r="2.5" fill="#4a90d9" opacity="0.7"><title>93MB @ t=3s</title></circle>
+<circle cx="148.6" cy="263.1" r="2.5" fill="#4a90d9" opacity="0.7"><title>93MB @ t=4s</title></circle>
+<circle cx="169.5" cy="242.4" r="2.5" fill="#4a90d9" opacity="0.7"><title>102MB @ t=5s</title></circle>
+<circle cx="190.4" cy="221.3" r="2.5" fill="#4a90d9" opacity="0.7"><title>111MB @ t=6s</title></circle>
+<circle cx="211.3" cy="221.6" r="2.5" fill="#4a90d9" opacity="0.7"><title>111MB @ t=7s</title></circle>
+<circle cx="232.2" cy="220.6" r="2.5" fill="#4a90d9" opacity="0.7"><title>111MB @ t=8s</title></circle>
+<circle cx="253.1" cy="218.9" r="2.5" fill="#4a90d9" opacity="0.7"><title>112MB @ t=9s</title></circle>
+<circle cx="274.0" cy="200.3" r="2.5" fill="#4a90d9" opacity="0.7"><title>120MB @ t=10s</title></circle>
+<circle cx="294.9" cy="182.5" r="2.5" fill="#4a90d9" opacity="0.7"><title>128MB @ t=11s</title></circle>
+<circle cx="315.8" cy="182.8" r="2.5" fill="#4a90d9" opacity="0.7"><title>127MB @ t=12s</title></circle>
+<circle cx="336.7" cy="184.3" r="2.5" fill="#4a90d9" opacity="0.7"><title>127MB @ t=13s</title></circle>
+<circle cx="357.6" cy="186.1" r="2.5" fill="#4a90d9" opacity="0.7"><title>126MB @ t=14s</title></circle>
+<circle cx="378.5" cy="168.7" r="2.5" fill="#4a90d9" opacity="0.7"><title>134MB @ t=15s</title></circle>
+<circle cx="399.4" cy="150.2" r="2.5" fill="#4a90d9" opacity="0.7"><title>142MB @ t=16s</title></circle>
+<circle cx="420.3" cy="130.5" r="2.5" fill="#4a90d9" opacity="0.7"><title>150MB @ t=17s</title></circle>
+<circle cx="441.2" cy="128.7" r="2.5" fill="#4a90d9" opacity="0.7"><title>151MB @ t=18s</title></circle>
+<circle cx="462.1" cy="127.0" r="2.5" fill="#4a90d9" opacity="0.7"><title>152MB @ t=19s</title></circle>
+<circle cx="482.9" cy="126.1" r="2.5" fill="#4a90d9" opacity="0.7"><title>152MB @ t=20s</title></circle>
+<circle cx="503.8" cy="126.5" r="2.5" fill="#4a90d9" opacity="0.7"><title>152MB @ t=21s</title></circle>
+<circle cx="524.7" cy="128.0" r="2.5" fill="#4a90d9" opacity="0.7"><title>151MB @ t=22s</title></circle>
+<circle cx="545.6" cy="111.8" r="2.5" fill="#4a90d9" opacity="0.7"><title>158MB @ t=23s</title></circle>
+<circle cx="566.5" cy="95.2" r="2.5" fill="#4a90d9" opacity="0.7"><title>165MB @ t=24s</title></circle>
+<circle cx="587.4" cy="77.4" r="2.5" fill="#4a90d9" opacity="0.7"><title>173MB @ t=25s</title></circle>
+<circle cx="608.3" cy="58.3" r="2.5" fill="#4a90d9" opacity="0.7"><title>181MB @ t=26s</title></circle>
+<circle cx="629.2" cy="38.5" r="2.5" fill="#4a90d9" opacity="0.7"><title>190MB @ t=27s</title></circle>
+<circle cx="650.1" cy="36.8" r="2.5" fill="#4a90d9" opacity="0.7"><title>191MB @ t=28s</title></circle>
+<circle cx="671.0" cy="36.0" r="2.5" fill="#4a90d9" opacity="0.7"><title>191MB @ t=29s</title></circle>
+<circle cx="691.9" cy="36.4" r="2.5" fill="#4a90d9" opacity="0.7"><title>191MB @ t=30s</title></circle>
+<circle cx="712.8" cy="40.7" r="2.5" fill="#4a90d9" opacity="0.7"><title>189MB @ t=31s</title></circle>
+<circle cx="733.7" cy="45.4" r="2.5" fill="#4a90d9" opacity="0.7"><title>187MB @ t=32s</title></circle>
+<circle cx="754.6" cy="49.6" r="2.5" fill="#4a90d9" opacity="0.7"><title>185MB @ t=33s</title></circle>
+<circle cx="775.5" cy="52.6" r="2.5" fill="#4a90d9" opacity="0.7"><title>184MB @ t=34s</title></circle>
+<circle cx="796.4" cy="54.4" r="2.5" fill="#4a90d9" opacity="0.7"><title>183MB @ t=35s</title></circle>
+<circle cx="817.3" cy="55.4" r="2.5" fill="#4a90d9" opacity="0.7"><title>183MB @ t=36s</title></circle>
+<circle cx="838.2" cy="56.5" r="2.5" fill="#4a90d9" opacity="0.7"><title>182MB @ t=37s</title></circle>
+<circle cx="859.1" cy="58.5" r="2.5" fill="#4a90d9" opacity="0.7"><title>181MB @ t=38s</title></circle>
+<circle cx="880.0" cy="61.8" r="2.5" fill="#4a90d9" opacity="0.7"><title>180MB @ t=39s</title></circle>
+<text x="12" y="150" text-anchor="middle" font-family="monospace" font-size="10" transform="rotate(-90,12,150)">RSS</text>
+</svg><div style="font-family:monospace;font-size:12px;color:#555;margin-top:6px">min: <b>92MB</b> &nbsp; avg: <b>148MB</b> &nbsp; peak: <b style="color:#e84040">191MB</b> &nbsp; samples: <b>40</b> &nbsp; interval: 1s &nbsp;|&nbsp; bands = resource eval windows (top 40 by duration) &nbsp; <svg width="12" height="12" style="vertical-align:middle"><rect width="12" height="12" fill="rgba(39,174,96,0.4)"/></svg> changed &nbsp; <svg width="12" height="12" style="vertical-align:middle"><rect width="12" height="12" fill="rgba(232,64,64,0.4)"/></svg> failed &nbsp; <svg width="12" height="12" style="vertical-align:middle"><rect width="12" height="12" fill="rgba(180,180,180,0.3)"/></svg> unchanged</div>
+</section>
+
+<section id="memory-segments">
+  <h2>Memory Segments (pmap)</h2>
+  <svg xmlns="http://www.w3.org/2000/svg" width="700" height="260" style="background:#fff;border:1px solid #e0e0e0;border-radius:4px;display:block">
+<text x="375" y="20" text-anchor="middle" font-family="monospace" font-size="12" font-weight="bold">Memory Segments by Category (pmap)</text>
+<text x="375" y="33" text-anchor="middle" font-family="monospace" font-size="10" fill="#666">RSS KB by segment type at start / mid / end</text>
+<line x1="70" y1="40" x2="70" y2="180" stroke="#bbb" stroke-width="1"/>
+<line x1="70" y1="180" x2="680" y2="180" stroke="#bbb" stroke-width="1"/>
+<line x1="66" y1="180.0" x2="70" y2="180.0" stroke="#888"/>
+<text x="64" y="184.0" text-anchor="end" font-family="monospace" font-size="10">0MB</text>
+<line x1="66" y1="180.0" x2="70" y2="180.0" stroke="#888"/>
+<text x="64" y="184.0" text-anchor="end" font-family="monospace" font-size="10">0MB</text>
+<line x1="66" y1="40.0" x2="70" y2="40.0" stroke="#888"/>
+<text x="64" y="44.0" text-anchor="end" font-family="monospace" font-size="10">0MB</text>
+<text x="171.7" y="194" text-anchor="middle" font-family="monospace" font-size="11" font-weight="bold">Start</text>
+<text x="375.0" y="194" text-anchor="middle" font-family="monospace" font-size="11" font-weight="bold">Mid</text>
+<text x="578.3" y="194" text-anchor="middle" font-family="monospace" font-size="11" font-weight="bold">End</text>
+<rect x="70" y="226" width="10" height="10" fill="#4a90d9" rx="2"/>
+<text x="83" y="236" font-family="monospace" font-size="9" fill="#333">Heap</text>
+<rect x="114.0" y="226" width="10" height="10" fill="#e87b2a" rx="2"/>
+<text x="127.0" y="236" font-family="monospace" font-size="9" fill="#333">Stack</text>
+<rect x="164.5" y="226" width="10" height="10" fill="#27ae60" rx="2"/>
+<text x="177.5" y="236" font-family="monospace" font-size="9" fill="#333">Shared libs</text>
+<rect x="254.0" y="226" width="10" height="10" fill="#9b59b6" rx="2"/>
+<text x="267.0" y="236" font-family="monospace" font-size="9" fill="#333">Files</text>
+<rect x="304.5" y="226" width="10" height="10" fill="#888" rx="2"/>
+<text x="317.5" y="236" font-family="monospace" font-size="9" fill="#333">Kernel</text>
+<rect x="361.5" y="226" width="10" height="10" fill="#aaa" rx="2"/>
+<text x="374.5" y="236" font-family="monospace" font-size="9" fill="#333">Other</text>
+<text x="12" y="110" text-anchor="middle" font-family="monospace" font-size="10" transform="rotate(-90,12,110)">RSS KB</text>
+</svg>
+</section>
+
+<section id="disk-io">
+  <h2>Disk I/O Rate</h2>
+  <svg xmlns="http://www.w3.org/2000/svg" width="900" height="220" style="background:#fff;border:1px solid #e0e0e0;border-radius:4px;display:block">
+<text x="472" y="20" text-anchor="middle" font-family="monospace" font-size="12" font-weight="bold">Disk I/O Rate (KB/s)</text>
+<line x1="65" y1="36" x2="65" y2="184" stroke="#bbb" stroke-width="1"/>
+<line x1="65" y1="184" x2="880" y2="184" stroke="#bbb" stroke-width="1"/>
+<line x1="61" y1="184.0" x2="65" y2="184.0" stroke="#888"/>
+<text x="59" y="188.0" text-anchor="end" font-family="monospace" font-size="10">0</text>
+<line x1="61" y1="110.0" x2="65" y2="110.0" stroke="#888"/>
+<text x="59" y="114.0" text-anchor="end" font-family="monospace" font-size="10">15932</text>
+<line x1="61" y1="36.0" x2="65" y2="36.0" stroke="#888"/>
+<text x="59" y="40.0" text-anchor="end" font-family="monospace" font-size="10">31865</text>
+<line x1="65.0" y1="184" x2="65.0" y2="188" stroke="#888"/>
+<text x="65.0" y="198" text-anchor="middle" font-family="monospace" font-size="10">0s</text>
+<line x1="268.8" y1="184" x2="268.8" y2="188" stroke="#888"/>
+<text x="268.8" y="198" text-anchor="middle" font-family="monospace" font-size="10">5s</text>
+<line x1="472.5" y1="184" x2="472.5" y2="188" stroke="#888"/>
+<text x="472.5" y="198" text-anchor="middle" font-family="monospace" font-size="10">10s</text>
+<line x1="676.2" y1="184" x2="676.2" y2="188" stroke="#888"/>
+<text x="676.2" y="198" text-anchor="middle" font-family="monospace" font-size="10">15s</text>
+<line x1="880.0" y1="184" x2="880.0" y2="188" stroke="#888"/>
+<text x="880.0" y="198" text-anchor="middle" font-family="monospace" font-size="10">20s</text>
+<rect x="571.9" y="36" width="198.5" height="148" fill="rgba(74,144,217,0.08)" stroke="none"><title>Package[docker-ce]</title></rect>
+<rect x="337.6" y="36" width="130.8" height="148" fill="rgba(74,144,217,0.08)" stroke="none"><title>Package[prometheus-node-exporter]</title></rect>
+<rect x="113.9" y="36" width="95.4" height="148" fill="rgba(74,144,217,0.08)" stroke="none"><title>Package[nginx]</title></rect>
+<rect x="213.3" y="36" width="76.2" height="148" fill="rgba(74,144,217,0.08)" stroke="none"><title>Package[vim]</title></rect>
+<rect x="72.3" y="36" width="38.7" height="148" fill="rgba(74,144,217,0.08)" stroke="none"><title>Service[sshd]</title></rect>
+<rect x="537.3" y="36" width="34.2" height="148" fill="rgba(74,144,217,0.08)" stroke="none"><title>Exec[update-ca-certificates]</title></rect>
+<rect x="770.8" y="36" width="27.3" height="148" fill="rgba(74,144,217,0.08)" stroke="none"><title>Service[docker]</title></rect>
+<rect x="468.8" y="36" width="22.4" height="148" fill="rgba(74,144,217,0.08)" stroke="none"><title>Service[prometheus-node-exporter]</title></rect>
+<rect x="289.9" y="36" width="18.3" height="148" fill="rgba(74,144,217,0.08)" stroke="none"><title>Service[nginx]</title></rect>
+<rect x="497.8" y="36" width="16.7" height="148" fill="rgba(74,144,217,0.08)" stroke="none"><title>Service[rsyslog]</title></rect>
+<rect x="804.2" y="36" width="15.5" height="148" fill="rgba(74,144,217,0.08)" stroke="none"><title>Service[chronyd]</title></rect>
+<rect x="835.2" y="36" width="12.6" height="148" fill="rgba(74,144,217,0.08)" stroke="none"><title>Service[auditd]</title></rect>
+<rect x="326.6" y="36" width="9.0" height="148" fill="rgba(74,144,217,0.08)" stroke="none"><title>Exec[sysctl -p]</title></rect>
+<rect x="821.3" y="36" width="9.0" height="148" fill="rgba(74,144,217,0.08)" stroke="none"><title>Service[apparmor]</title></rect>
+<rect x="518.1" y="36" width="7.3" height="148" fill="rgba(74,144,217,0.08)" stroke="none"><title>Exec[iptables-restore]</title></rect>
+<rect x="314.8" y="36" width="5.7" height="148" fill="rgba(74,144,217,0.08)" stroke="none"><title>User[deploy]</title></rect>
+<rect x="65.0" y="36" width="4.9" height="148" fill="rgba(74,144,217,0.08)" stroke="none"><title>File[/etc/ssh/sshd_config]</title></rect>
+<rect x="530.0" y="36" width="4.5" height="148" fill="rgba(74,144,217,0.08)" stroke="none"><title>File[/etc/ssl/certs/example.crt]</title></rect>
+<rect x="525.9" y="36" width="3.7" height="148" fill="rgba(74,144,217,0.08)" stroke="none"><title>File[/etc/iptables/rules.v4]</title></rect>
+<rect x="308.7" y="36" width="3.3" height="148" fill="rgba(74,144,217,0.08)" stroke="none"><title>File[/etc/nginx/nginx.conf]</title></rect>
+<polyline points="83.9,147.2 102.9,161.0 121.8,164.4 140.8,166.3 159.7,167.6 178.7,168.6 197.6,169.3 216.6,169.9 235.6,170.5 254.5,170.9 273.5,171.3 292.4,171.6 311.4,171.9 330.3,172.2 349.3,172.5 368.2,172.7 387.2,172.9 406.2,173.1 425.1,173.3 444.1,173.4 463.0,173.6 482.0,173.8 500.9,173.9 519.9,174.0 538.8,174.1 557.8,174.3 576.7,174.4 595.7,174.5 614.6,174.6 633.6,174.7 652.5,174.8 671.5,174.9 690.4,174.9 709.4,175.0 728.4,175.1 747.3,175.2 766.3,175.3 785.2,175.3 804.2,175.4 823.1,175.5 842.1,175.5 861.0,175.6 880.0,175.7" fill="none" stroke="#4a90d9" stroke-width="2" stroke-linejoin="round"/>
+<polyline points="83.9,172.2 102.9,169.3 121.8,165.7 140.8,161.3 159.7,155.9 178.7,149.5 197.6,141.8 216.6,132.9 235.6,122.7 254.5,111.1 273.5,98.5 292.4,85.4 311.4,72.2 330.3,59.9 349.3,49.2 368.2,41.1 387.2,36.5 406.2,36.0 425.1,38.8 444.1,45.6 463.0,55.3 482.0,67.1 500.9,80.1 519.9,93.3 538.8,106.2 557.8,118.3 576.7,128.9 595.7,138.4 614.6,146.6 633.6,153.5 652.5,159.3 671.5,164.0 690.4,168.0 709.4,171.1 728.4,173.7 747.3,175.8 766.3,177.5 785.2,178.8 804.2,179.9 823.1,180.7 842.1,181.4 861.0,181.9 880.0,182.4" fill="none" stroke="#e87b2a" stroke-width="2" stroke-linejoin="round"/>
+<text x="12" y="110" text-anchor="middle" font-family="monospace" font-size="10" transform="rotate(-90,12,110)">KB/s</text>
+<rect x="750" y="40" width="10" height="10" fill="#4a90d9"/>
+<text x="764" y="49" font-family="monospace" font-size="10">read rate</text>
+<rect x="750" y="56" width="10" height="10" fill="#e87b2a"/>
+<text x="764" y="65" font-family="monospace" font-size="10">write rate</text>
+</svg>
+</section>
+
+<section id="net-io">
+  <h2>Network Connections Over Time</h2>
+  <svg xmlns="http://www.w3.org/2000/svg" width="900" height="180" style="background:#fff;border:1px solid #e0e0e0;border-radius:4px;display:block">
+<text x="465" y="20" text-anchor="middle" font-family="monospace" font-size="12" font-weight="bold">Network Connections Over Time</text>
+<line x1="50" y1="36" x2="50" y2="144" stroke="#bbb" stroke-width="1"/>
+<line x1="50" y1="144" x2="880" y2="144" stroke="#bbb" stroke-width="1"/>
+<line x1="46" y1="144.0" x2="50" y2="144.0" stroke="#888"/>
+<text x="44" y="148.0" text-anchor="end" font-family="monospace" font-size="10">0</text>
+<line x1="46" y1="122.4" x2="50" y2="122.4" stroke="#888"/>
+<text x="44" y="126.4" text-anchor="end" font-family="monospace" font-size="10">1</text>
+<line x1="46" y1="100.8" x2="50" y2="100.8" stroke="#888"/>
+<text x="44" y="104.8" text-anchor="end" font-family="monospace" font-size="10">2</text>
+<line x1="46" y1="79.2" x2="50" y2="79.2" stroke="#888"/>
+<text x="44" y="83.2" text-anchor="end" font-family="monospace" font-size="10">3</text>
+<line x1="46" y1="57.6" x2="50" y2="57.6" stroke="#888"/>
+<text x="44" y="61.6" text-anchor="end" font-family="monospace" font-size="10">4</text>
+<line x1="46" y1="36.0" x2="50" y2="36.0" stroke="#888"/>
+<text x="44" y="40.0" text-anchor="end" font-family="monospace" font-size="10">5</text>
+<line x1="50.0" y1="144" x2="50.0" y2="148" stroke="#888"/>
+<text x="50.0" y="158" text-anchor="middle" font-family="monospace" font-size="10">0s</text>
+<line x1="257.5" y1="144" x2="257.5" y2="148" stroke="#888"/>
+<text x="257.5" y="158" text-anchor="middle" font-family="monospace" font-size="10">4s</text>
+<line x1="465.0" y1="144" x2="465.0" y2="148" stroke="#888"/>
+<text x="465.0" y="158" text-anchor="middle" font-family="monospace" font-size="10">9s</text>
+<line x1="672.5" y1="144" x2="672.5" y2="148" stroke="#888"/>
+<text x="672.5" y="158" text-anchor="middle" font-family="monospace" font-size="10">14s</text>
+<line x1="880.0" y1="144" x2="880.0" y2="148" stroke="#888"/>
+<text x="880.0" y="158" text-anchor="middle" font-family="monospace" font-size="10">18s</text>
+<rect x="623.6" y="36" width="224.6" height="108" fill="rgba(74,144,217,0.08)" stroke="none"/>
+<rect x="358.5" y="36" width="148.0" height="108" fill="rgba(74,144,217,0.08)" stroke="none"/>
+<rect x="105.3" y="36" width="107.9" height="108" fill="rgba(74,144,217,0.08)" stroke="none"/>
+<rect x="217.8" y="36" width="86.2" height="108" fill="rgba(74,144,217,0.08)" stroke="none"/>
+<rect x="58.3" y="36" width="43.8" height="108" fill="rgba(74,144,217,0.08)" stroke="none"/>
+<rect x="584.4" y="36" width="38.7" height="108" fill="rgba(74,144,217,0.08)" stroke="none"/>
+<rect x="848.6" y="36" width="30.9" height="108" fill="rgba(74,144,217,0.08)" stroke="none"/>
+<rect x="507.0" y="36" width="25.4" height="108" fill="rgba(74,144,217,0.08)" stroke="none"/>
+<rect x="304.5" y="36" width="20.8" height="108" fill="rgba(74,144,217,0.08)" stroke="none"/>
+<rect x="539.7" y="36" width="18.9" height="108" fill="rgba(74,144,217,0.08)" stroke="none"/>
+<rect x="886.5" y="36" width="17.5" height="108" fill="rgba(74,144,217,0.08)" stroke="none"/>
+<rect x="921.5" y="36" width="14.3" height="108" fill="rgba(74,144,217,0.08)" stroke="none"/>
+<rect x="346.0" y="36" width="10.1" height="108" fill="rgba(74,144,217,0.08)" stroke="none"/>
+<rect x="905.8" y="36" width="10.1" height="108" fill="rgba(74,144,217,0.08)" stroke="none"/>
+<rect x="562.8" y="36" width="8.3" height="108" fill="rgba(74,144,217,0.08)" stroke="none"/>
+<rect x="332.7" y="36" width="6.5" height="108" fill="rgba(74,144,217,0.08)" stroke="none"/>
+<rect x="50.0" y="36" width="5.5" height="108" fill="rgba(74,144,217,0.08)" stroke="none"/>
+<rect x="576.1" y="36" width="5.1" height="108" fill="rgba(74,144,217,0.08)" stroke="none"/>
+<rect x="571.5" y="36" width="4.1" height="108" fill="rgba(74,144,217,0.08)" stroke="none"/>
+<rect x="325.7" y="36" width="3.7" height="108" fill="rgba(74,144,217,0.08)" stroke="none"/>
+<polyline points="50.0,100.8 188.3,100.8 188.3,79.2 326.7,79.2 326.7,36.0 465.0,36.0 465.0,79.2 603.3,79.2 603.3,100.8 741.7,100.8 741.7,122.4 880.0,122.4 880.0,144.0" fill="none" stroke="#27ae60" stroke-width="2.5"/>
+<circle cx="50.0" cy="100.8" r="3" fill="#27ae60" opacity="0.8"><title>2 connections @ t=0s</title></circle>
+<circle cx="188.3" cy="79.2" r="3" fill="#27ae60" opacity="0.8"><title>3 connections @ t=3s</title></circle>
+<circle cx="326.7" cy="36.0" r="3" fill="#27ae60" opacity="0.8"><title>5 connections @ t=6s</title></circle>
+<circle cx="465.0" cy="79.2" r="3" fill="#27ae60" opacity="0.8"><title>3 connections @ t=9s</title></circle>
+<circle cx="603.3" cy="100.8" r="3" fill="#27ae60" opacity="0.8"><title>2 connections @ t=12s</title></circle>
+<circle cx="741.7" cy="122.4" r="3" fill="#27ae60" opacity="0.8"><title>1 connections @ t=15s</title></circle>
+<circle cx="880.0" cy="144.0" r="3" fill="#27ae60" opacity="0.8"><title>0 connections @ t=18s</title></circle>
+<text x="12" y="90" text-anchor="middle" font-family="monospace" font-size="10" transform="rotate(-90,12,90)">connections</text>
+</svg>
+</section>
+
+<section id="cpu">
+  <h2>CPU%</h2>
+  <svg xmlns="http://www.w3.org/2000/svg" width="700" height="200" style="background:#fff;border:1px solid #e0e0e0;border-radius:4px">
+<text x="350" y="14" text-anchor="middle" font-family="monospace" font-size="12" font-weight="bold">CPU% over time</text>
+<line x1="40" y1="40" x2="40" y2="160" stroke="#888" stroke-width="1"/>
+<line x1="40" y1="160" x2="660" y2="160" stroke="#888" stroke-width="1"/>
+<line x1="36" y1="160.0" x2="40" y2="160.0" stroke="#888"/>
+<text x="34" y="164.0" text-anchor="end" font-family="monospace" font-size="10">120</text>
+<line x1="36" y1="100.0" x2="40" y2="100.0" stroke="#888"/>
+<text x="34" y="104.0" text-anchor="end" font-family="monospace" font-size="10">120</text>
+<line x1="36" y1="40.0" x2="40" y2="40.0" stroke="#888"/>
+<text x="34" y="44.0" text-anchor="end" font-family="monospace" font-size="10">121</text>
+<polyline points="40.0,160.0 56.3,160.0 72.6,160.0 88.9,160.0 105.3,160.0 121.6,160.0 137.9,160.0 154.2,160.0 170.5,160.0 186.8,160.0 203.2,160.0 219.5,160.0 235.8,160.0 252.1,160.0 268.4,160.0 284.7,160.0 301.1,160.0 317.4,160.0 333.7,160.0 350.0,160.0 366.3,160.0 382.6,160.0 398.9,160.0 415.3,160.0 431.6,160.0 447.9,160.0 464.2,160.0 480.5,160.0 496.8,160.0 513.2,160.0 529.5,160.0 545.8,160.0 562.1,160.0 578.4,160.0 594.7,160.0 611.1,160.0 627.4,160.0 643.7,160.0 660.0,160.0" fill="none" stroke="#e84040" stroke-width="2"/>
+<text x="10" y="100" text-anchor="middle" font-family="monospace" font-size="10" transform="rotate(-90,10,100)">CPU%</text>
+</svg>
+</section>
+
+<section id="flamegraph"><h2>Flamegraph / Stack Summary</h2><div class="chart-empty">Not available (requires perf + flamegraph.pl as root, or /proc/PID/stack samples).</div></section>
+
+<section id="profile-flamegraph"><h2>Profile Flamegraph (Catalog Compilation)</h2><div class="chart-empty">Not available — no PROFILE entries captured. Ensure puppetserver is reachable via SSH and received the --profile flag.</div></section>
+
+<section id="rbspy-flamegraph"><h2>Ruby-level Flamegraph (rbspy)</h2><div class="chart-empty">Not available (rbspy not installed or not root).</div></section>
+
+<section id="http-phases">
+  <h2>HTTP Phase Waterfall</h2>
+  <div class="chart-empty">No HTTP phases detected in strace (requires strace + root + puppet agent mode).</div>
+</section>
+
+
+
+
+
+
+
+
+
+<section id="latency">
+  <h2>Step Latency</h2>
+  <table>
+    <tr><th>Step</th><th>Duration</th><th>Delta from prev</th></tr>
+    <tr><td>Load facts</td><td>0.00s</td><td>+0.00s</td></tr>
+<tr><td>Compile catalog</td><td>4.12s</td><td>+4.12s</td></tr>
+<tr><td>Apply catalog</td><td>0.00s</td><td>-4.12s</td></tr>
+<tr class="slow"><td>Apply complete</td><td>18.74s</td><td>+18.74s</td></tr>
+
+  </table>
+</section>
+
+<section id="files">
+  <h2>File Access (top 20 by count)</h2>
+  <table>
+    <tr><th>Path</th><th>Count</th><th>Operations</th></tr>
+    <tr><td>/etc/puppet/puppet.conf</td><td>1</td><td>openat</td></tr>
+<tr><td>/etc/ssh/sshd_config.puppet_tmp</td><td>1</td><td>openat</td></tr>
+<tr><td># managed by puppet\n</td><td>1</td><td>write</td></tr>
+<tr><td>/etc/motd.puppet_tmp</td><td>1</td><td>openat</td></tr>
+<tr><td>Welcome\n</td><td>1</td><td>write</td></tr>
+<tr><td>[&quot;systemctl&quot;,</td><td>1</td><td>execve(&quot;/usr/bin/systemctl&quot;,</td></tr>
+<tr><td>/var/cache/apt/pkgcache.bin</td><td>1</td><td>openat</td></tr>
+
+  </table>
+</section>
+
+<section id="network">
+  <h2>Network Connections</h2>
+  <table>
+    <tr><th>State</th><th>Local</th><th>Remote</th></tr>
+    <tr><td colspan="3">(no connections captured)</td></tr>
+  </table>
+</section>
+
+<section id="resources">
+  <h2>Per-Resource I/O Attribution</h2>
+  <p style="color:#888;font-size:0.85em">strace correlation active — click row to expand file/process/network detail. Sorted by disk written.</p>
+  <table id="res-table" data-sort-dir="desc">
+    <thead>
+      <tr>
+        <th onclick="sortTable(0)">Resource</th>
+        <th onclick="sortTable(1)">Type</th>
+        <th onclick="sortTable(2)">Status</th>
+        <th onclick="sortTable(3)">Duration</th>
+        <th onclick="sortTable(4)">Disk Written</th>
+        <th onclick="sortTable(5)">Disk Read</th>
+        <th onclick="sortTable(6)" title="RSS delta during resource eval">Mem Δ</th>
+        <th onclick="sortTable(7)" title="Peak RSS during resource eval">Mem Peak</th>
+        <th onclick="sortTable(8)">Processes</th>
+        <th onclick="sortTable(9)">Top File Written</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr onclick="toggleDetail('res-0')" style="cursor:pointer">
+  <td>File[/etc/ssh/sshd_config]</td>
+  <td>File</td>
+  <td><span style="background:#d4edda;color:#1a6b3a;padding:2px 7px;border-radius:3px;font-size:0.8em;font-weight:bold">changed</span></td>
+  <td>0.120s</td>
+  <td>0.0 B</td>
+  <td>0.0 B</td>
+  <td style="font-size:0.85em;">+0MB</td>
+  <td style="font-size:0.85em">92MB</td>
+  <td style="font-size:0.85em">—</td>
+  <td style="font-size:0.85em">/etc/ssh/sshd_config</td>
+</tr>
+<tr id="res-0-detail" style="display:none">
+  <td colspan="10" style="background:#f8f9fb;padding:12px">
+    <p style="margin-top:4px;font-size:0.85em;color:#555">Source: <code>manifests/files.pp</code>:<code>1</code></p>
+    <div style="margin-bottom:8px">
+    <b>Change:</b>
+    <table style="width:100%;margin-top:4px;font-family:monospace;font-size:12px">
+      <tr><th style="width:50%">Before</th><th style="width:50%">After</th></tr>
+      <tr><td style="background:#fff0f0;padding:4px 8px">{md5}aabbcc112233</td>
+          <td style="background:#f0fff0;padding:4px 8px">{md5}99eeff001122</td></tr>
+    </table></div>
+    <p style="margin-top:6px;font-size:0.85em;color:#555">Memory during eval — start: <b>92MB</b> &nbsp; peak: <b>92MB</b> &nbsp; delta: <b style="">+0MB</b></p>
+    <b>Parameters (5):</b>
+    <table style="width:100%;margin-bottom:8px;margin-top:4px">
+      <tr><th>Key</th><th>Value</th></tr><tr><td style="font-weight:bold">content</td><td style="font-family:monospace;font-size:11px"># managed by Puppet
+...</td></tr><tr><td style="font-weight:bold">ensure</td><td style="font-family:monospace;font-size:11px">file</td></tr><tr><td style="font-weight:bold">group</td><td style="font-family:monospace;font-size:11px">root</td></tr><tr><td style="font-weight:bold">mode</td><td style="font-family:monospace;font-size:11px">0600</td></tr><tr><td style="font-weight:bold">owner</td><td style="font-family:monospace;font-size:11px">root</td></tr>
+    </table>
+    <b>Files written (1):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td>/etc/ssh/sshd_config</td><td>0.0 B</td><td>1</td></tr>
+    </table>
+    <b>Files read (1):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td>/etc/ssh/sshd_config.puppet_tmp</td><td>0.0 B</td><td>1</td></tr>
+    </table>
+    <b>Processes (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>PID</th><th>Exe</th><th>Args</th><th>Written</th><th>Read</th></tr><tr><td colspan="5">none</td></tr>
+    </table>
+    <b>Network (0):</b>
+    <table style="width:100%">
+      <tr><th>Remote</th><th>Direction</th></tr><tr><td colspan="2">none</td></tr>
+    </table>
+    <p style="margin-top:6px;color:#888;font-size:0.85em">strace events in window: 2</p>
+  </td>
+</tr><tr onclick="toggleDetail('res-1')" style="cursor:pointer">
+  <td>Service[sshd]</td>
+  <td>Service</td>
+  <td><span style="background:#d4edda;color:#1a6b3a;padding:2px 7px;border-radius:3px;font-size:0.8em;font-weight:bold">changed</span></td>
+  <td>0.950s</td>
+  <td>0.0 B</td>
+  <td>0.0 B</td>
+  <td style="font-size:0.85em;">+0MB</td>
+  <td style="font-size:0.85em">92MB</td>
+  <td style="font-size:0.85em">systemctl</td>
+  <td style="font-size:0.85em">—</td>
+</tr>
+<tr id="res-1-detail" style="display:none">
+  <td colspan="10" style="background:#f8f9fb;padding:12px">
+    <p style="margin-top:4px;font-size:0.85em;color:#555">Source: <code>manifests/services.pp</code>:<code>1</code></p>
+    <div style="margin-bottom:8px">
+    <b>Change:</b>
+    <table style="width:100%;margin-top:4px;font-family:monospace;font-size:12px">
+      <tr><th style="width:50%">Before</th><th style="width:50%">After</th></tr>
+      <tr><td style="background:#fff0f0;padding:4px 8px">stopped</td>
+          <td style="background:#f0fff0;padding:4px 8px">running</td></tr>
+    </table></div>
+    <p style="margin-top:6px;font-size:0.85em;color:#555">Memory during eval — start: <b>92MB</b> &nbsp; peak: <b>92MB</b> &nbsp; delta: <b style="">+0MB</b></p>
+    <b>Parameters (3):</b>
+    <table style="width:100%;margin-bottom:8px;margin-top:4px">
+      <tr><th>Key</th><th>Value</th></tr><tr><td style="font-weight:bold">ensure</td><td style="font-family:monospace;font-size:11px">running</td></tr><tr><td style="font-weight:bold">subscribe</td><td style="font-family:monospace;font-size:11px">File[/etc/ssh/sshd_config]</td></tr><tr><td style="font-weight:normal">enable</td><td style="font-family:monospace;font-size:11px">True</td></tr>
+    </table>
+    <b>Files written (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td colspan="3">none</td></tr>
+    </table>
+    <b>Files read (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td colspan="3">none</td></tr>
+    </table>
+    <b>Processes (1):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>PID</th><th>Exe</th><th>Args</th><th>Written</th><th>Read</th></tr><tr><td>99990</td><td>/usr/bin/systemctl</td><td>systemctl restart sshd</td><td>0.0 B</td><td>0.0 B</td></tr>
+    </table>
+    <b>Network (0):</b>
+    <table style="width:100%">
+      <tr><th>Remote</th><th>Direction</th></tr><tr><td colspan="2">none</td></tr>
+    </table>
+    <p style="margin-top:6px;color:#888;font-size:0.85em">strace events in window: 14</p>
+  </td>
+</tr><tr onclick="toggleDetail('res-2')" style="cursor:pointer">
+  <td>File[/etc/motd]</td>
+  <td>File</td>
+  <td><span style="background:#d4edda;color:#1a6b3a;padding:2px 7px;border-radius:3px;font-size:0.8em;font-weight:bold">changed</span></td>
+  <td>0.030s</td>
+  <td>512.0 KB</td>
+  <td>0.0 B</td>
+  <td style="font-size:0.85em;">+0MB</td>
+  <td style="font-size:0.85em">92MB</td>
+  <td style="font-size:0.85em">—</td>
+  <td style="font-size:0.85em">/etc/motd</td>
+</tr>
+<tr id="res-2-detail" style="display:none">
+  <td colspan="10" style="background:#f8f9fb;padding:12px">
+    <p style="margin-top:4px;font-size:0.85em;color:#555">Source: <code>manifests/files.pp</code>:<code>1</code></p>
+    <div style="margin-bottom:8px">
+    <b>Change:</b>
+    <table style="width:100%;margin-top:4px;font-family:monospace;font-size:12px">
+      <tr><th style="width:50%">Before</th><th style="width:50%">After</th></tr>
+      <tr><td style="background:#fff0f0;padding:4px 8px">Welcome to old.example.com</td>
+          <td style="background:#f0fff0;padding:4px 8px">Welcome to example.com</td></tr>
+    </table></div>
+    <p style="margin-top:6px;font-size:0.85em;color:#555">Memory during eval — start: <b>92MB</b> &nbsp; peak: <b>92MB</b> &nbsp; delta: <b style="">+0MB</b></p>
+    <b>Parameters (5):</b>
+    <table style="width:100%;margin-bottom:8px;margin-top:4px">
+      <tr><th>Key</th><th>Value</th></tr><tr><td style="font-weight:bold">content</td><td style="font-family:monospace;font-size:11px">Welcome to example.com</td></tr><tr><td style="font-weight:bold">ensure</td><td style="font-family:monospace;font-size:11px">file</td></tr><tr><td style="font-weight:bold">group</td><td style="font-family:monospace;font-size:11px">root</td></tr><tr><td style="font-weight:bold">mode</td><td style="font-family:monospace;font-size:11px">0644</td></tr><tr><td style="font-weight:bold">owner</td><td style="font-family:monospace;font-size:11px">root</td></tr>
+    </table>
+    <b>Files written (1):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td>/etc/motd</td><td>512.0 KB</td><td>1</td></tr>
+    </table>
+    <b>Files read (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td colspan="3">none</td></tr>
+    </table>
+    <b>Processes (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>PID</th><th>Exe</th><th>Args</th><th>Written</th><th>Read</th></tr><tr><td colspan="5">none</td></tr>
+    </table>
+    <b>Network (0):</b>
+    <table style="width:100%">
+      <tr><th>Remote</th><th>Direction</th></tr><tr><td colspan="2">none</td></tr>
+    </table>
+    <p style="margin-top:6px;color:#888;font-size:0.85em">strace events in window: 2</p>
+  </td>
+</tr><tr onclick="toggleDetail('res-3')" style="cursor:pointer">
+  <td>File[/etc/sysctl.d/99-custom.conf]</td>
+  <td>File</td>
+  <td><span style="background:#d4edda;color:#1a6b3a;padding:2px 7px;border-radius:3px;font-size:0.8em;font-weight:bold">changed</span></td>
+  <td>0.030s</td>
+  <td>512.0 KB</td>
+  <td>0.0 B</td>
+  <td style="font-size:0.85em;">+0MB</td>
+  <td style="font-size:0.85em">112MB</td>
+  <td style="font-size:0.85em">—</td>
+  <td style="font-size:0.85em">/etc/sysctl.d/99-custom.conf</td>
+</tr>
+<tr id="res-3-detail" style="display:none">
+  <td colspan="10" style="background:#f8f9fb;padding:12px">
+    <p style="margin-top:4px;font-size:0.85em;color:#555">Source: <code>manifests/files.pp</code>:<code>20</code></p>
+    
+    <p style="margin-top:6px;font-size:0.85em;color:#555">Memory during eval — start: <b>112MB</b> &nbsp; peak: <b>112MB</b> &nbsp; delta: <b style="">+0MB</b></p>
+    <b>Parameters (4):</b>
+    <table style="width:100%;margin-bottom:8px;margin-top:4px">
+      <tr><th>Key</th><th>Value</th></tr><tr><td style="font-weight:bold">content</td><td style="font-family:monospace;font-size:11px">net.ipv4.ip_forward=1
+vm.swappiness=10
+</td></tr><tr><td style="font-weight:bold">ensure</td><td style="font-family:monospace;font-size:11px">file</td></tr><tr><td style="font-weight:bold">mode</td><td style="font-family:monospace;font-size:11px">0644</td></tr><tr><td style="font-weight:bold">owner</td><td style="font-family:monospace;font-size:11px">root</td></tr>
+    </table>
+    <b>Files written (1):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td>/etc/sysctl.d/99-custom.conf</td><td>512.0 KB</td><td>1</td></tr>
+    </table>
+    <b>Files read (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td colspan="3">none</td></tr>
+    </table>
+    <b>Processes (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>PID</th><th>Exe</th><th>Args</th><th>Written</th><th>Read</th></tr><tr><td colspan="5">none</td></tr>
+    </table>
+    <b>Network (0):</b>
+    <table style="width:100%">
+      <tr><th>Remote</th><th>Direction</th></tr><tr><td colspan="2">none</td></tr>
+    </table>
+    <p style="margin-top:6px;color:#888;font-size:0.85em">strace events in window: 2</p>
+  </td>
+</tr><tr onclick="toggleDetail('res-4')" style="cursor:pointer">
+  <td>File[/etc/nginx/nginx.conf]</td>
+  <td>File</td>
+  <td><span style="background:#d4edda;color:#1a6b3a;padding:2px 7px;border-radius:3px;font-size:0.8em;font-weight:bold">changed</span></td>
+  <td>0.080s</td>
+  <td>5.0 MB</td>
+  <td>4.0 KB</td>
+  <td style="font-size:0.85em;">+0MB</td>
+  <td style="font-size:0.85em">112MB</td>
+  <td style="font-size:0.85em">—</td>
+  <td style="font-size:0.85em">/etc/nginx/nginx.conf</td>
+</tr>
+<tr id="res-4-detail" style="display:none">
+  <td colspan="10" style="background:#f8f9fb;padding:12px">
+    <p style="margin-top:4px;font-size:0.85em;color:#555">Source: <code>manifests/files.pp</code>:<code>18</code></p>
+    <div style="margin-bottom:8px">
+    <b>Change:</b>
+    <table style="width:100%;margin-top:4px;font-family:monospace;font-size:12px">
+      <tr><th style="width:50%">Before</th><th style="width:50%">After</th></tr>
+      <tr><td style="background:#fff0f0;padding:4px 8px">{md5}deadbeef0000</td>
+          <td style="background:#f0fff0;padding:4px 8px">{md5}cafebabe1234</td></tr>
+    </table></div>
+    <p style="margin-top:6px;font-size:0.85em;color:#555">Memory during eval — start: <b>112MB</b> &nbsp; peak: <b>112MB</b> &nbsp; delta: <b style="">+0MB</b></p>
+    <b>Parameters (5):</b>
+    <table style="width:100%;margin-bottom:8px;margin-top:4px">
+      <tr><th>Key</th><th>Value</th></tr><tr><td style="font-weight:bold">ensure</td><td style="font-family:monospace;font-size:11px">file</td></tr><tr><td style="font-weight:bold">group</td><td style="font-family:monospace;font-size:11px">root</td></tr><tr><td style="font-weight:bold">mode</td><td style="font-family:monospace;font-size:11px">0644</td></tr><tr><td style="font-weight:bold">owner</td><td style="font-family:monospace;font-size:11px">root</td></tr><tr><td style="font-weight:bold">source</td><td style="font-family:monospace;font-size:11px">puppet:///modules/nginx/nginx.conf</td></tr>
+    </table>
+    <b>Files written (1):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td>/etc/nginx/nginx.conf</td><td>5.0 MB</td><td>1</td></tr>
+    </table>
+    <b>Files read (1):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td>/etc/nginx/nginx.conf.puppet_tmp</td><td>4.0 KB</td><td>1</td></tr>
+    </table>
+    <b>Processes (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>PID</th><th>Exe</th><th>Args</th><th>Written</th><th>Read</th></tr><tr><td colspan="5">none</td></tr>
+    </table>
+    <b>Network (0):</b>
+    <table style="width:100%">
+      <tr><th>Remote</th><th>Direction</th></tr><tr><td colspan="2">none</td></tr>
+    </table>
+    <p style="margin-top:6px;color:#888;font-size:0.85em">strace events in window: 2</p>
+  </td>
+</tr><tr onclick="toggleDetail('res-5')" style="cursor:pointer">
+  <td>File[/etc/rsyslog.conf]</td>
+  <td>File</td>
+  <td><span style="background:#d4edda;color:#1a6b3a;padding:2px 7px;border-radius:3px;font-size:0.8em;font-weight:bold">changed</span></td>
+  <td>0.060s</td>
+  <td>5.0 MB</td>
+  <td>0.0 B</td>
+  <td style="font-size:0.85em;">+0MB</td>
+  <td style="font-size:0.85em">124MB</td>
+  <td style="font-size:0.85em">—</td>
+  <td style="font-size:0.85em">/etc/rsyslog.conf</td>
+</tr>
+<tr id="res-5-detail" style="display:none">
+  <td colspan="10" style="background:#f8f9fb;padding:12px">
+    <p style="margin-top:4px;font-size:0.85em;color:#555">Source: <code>manifests/files.pp</code>:<code>32</code></p>
+    
+    <p style="margin-top:6px;font-size:0.85em;color:#555">Memory during eval — start: <b>123MB</b> &nbsp; peak: <b>124MB</b> &nbsp; delta: <b style="">+0MB</b></p>
+    <b>Parameters (5):</b>
+    <table style="width:100%;margin-bottom:8px;margin-top:4px">
+      <tr><th>Key</th><th>Value</th></tr><tr><td style="font-weight:bold">ensure</td><td style="font-family:monospace;font-size:11px">file</td></tr><tr><td style="font-weight:bold">group</td><td style="font-family:monospace;font-size:11px">root</td></tr><tr><td style="font-weight:bold">mode</td><td style="font-family:monospace;font-size:11px">0644</td></tr><tr><td style="font-weight:bold">owner</td><td style="font-family:monospace;font-size:11px">root</td></tr><tr><td style="font-weight:bold">source</td><td style="font-family:monospace;font-size:11px">puppet:///modules/rsyslog/rsyslog.conf</td></tr>
+    </table>
+    <b>Files written (1):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td>/etc/rsyslog.conf</td><td>5.0 MB</td><td>1</td></tr>
+    </table>
+    <b>Files read (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td colspan="3">none</td></tr>
+    </table>
+    <b>Processes (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>PID</th><th>Exe</th><th>Args</th><th>Written</th><th>Read</th></tr><tr><td colspan="5">none</td></tr>
+    </table>
+    <b>Network (0):</b>
+    <table style="width:100%">
+      <tr><th>Remote</th><th>Direction</th></tr><tr><td colspan="2">none</td></tr>
+    </table>
+    <p style="margin-top:6px;color:#888;font-size:0.85em">strace events in window: 2</p>
+  </td>
+</tr><tr onclick="toggleDetail('res-6')" style="cursor:pointer">
+  <td>Package[nginx]</td>
+  <td>Package</td>
+  <td><span style="background:#d4edda;color:#1a6b3a;padding:2px 7px;border-radius:3px;font-size:0.8em;font-weight:bold">changed</span></td>
+  <td>2.340s</td>
+  <td>50.0 MB</td>
+  <td>10.0 MB</td>
+  <td style="font-size:0.85em;">+0MB</td>
+  <td style="font-size:0.85em">92MB</td>
+  <td style="font-size:0.85em">apt-get</td>
+  <td style="font-size:0.85em">—</td>
+</tr>
+<tr id="res-6-detail" style="display:none">
+  <td colspan="10" style="background:#f8f9fb;padding:12px">
+    <p style="margin-top:4px;font-size:0.85em;color:#555">Source: <code>manifests/packages.pp</code>:<code>4</code></p>
+    <div style="margin-bottom:8px">
+    <b>Change:</b>
+    <table style="width:100%;margin-top:4px;font-family:monospace;font-size:12px">
+      <tr><th style="width:50%">Before</th><th style="width:50%">After</th></tr>
+      <tr><td style="background:#fff0f0;padding:4px 8px">absent</td>
+          <td style="background:#f0fff0;padding:4px 8px">1.24.0-1ubuntu1</td></tr>
+    </table></div>
+    <p style="margin-top:6px;font-size:0.85em;color:#555">Memory during eval — start: <b>92MB</b> &nbsp; peak: <b>92MB</b> &nbsp; delta: <b style="">+0MB</b></p>
+    <b>Parameters (2):</b>
+    <table style="width:100%;margin-bottom:8px;margin-top:4px">
+      <tr><th>Key</th><th>Value</th></tr><tr><td style="font-weight:bold">ensure</td><td style="font-family:monospace;font-size:11px">present</td></tr><tr><td style="font-weight:bold">provider</td><td style="font-family:monospace;font-size:11px">apt</td></tr>
+    </table>
+    <b>Files written (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td colspan="3">none</td></tr>
+    </table>
+    <b>Files read (1):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td>/var/cache/apt/archives/nginx_1.24_amd64.deb</td><td>10.0 MB</td><td>1</td></tr>
+    </table>
+    <b>Processes (1):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>PID</th><th>Exe</th><th>Args</th><th>Written</th><th>Read</th></tr><tr><td>99990</td><td>/usr/bin/apt-get</td><td>apt-get -y install nginx</td><td>50.0 MB</td><td>10.0 MB</td></tr>
+    </table>
+    <b>Network (0):</b>
+    <table style="width:100%">
+      <tr><th>Remote</th><th>Direction</th></tr><tr><td colspan="2">none</td></tr>
+    </table>
+    <p style="margin-top:6px;color:#888;font-size:0.85em">strace events in window: 35</p>
+  </td>
+</tr><tr onclick="toggleDetail('res-7')" style="cursor:pointer">
+  <td>Package[vim]</td>
+  <td>Package</td>
+  <td><span style="background:#d4edda;color:#1a6b3a;padding:2px 7px;border-radius:3px;font-size:0.8em;font-weight:bold">changed</span></td>
+  <td>1.870s</td>
+  <td>50.0 MB</td>
+  <td>10.0 MB</td>
+  <td style="font-size:0.85em;color:#e84040;font-weight:bold">+14MB</td>
+  <td style="font-size:0.85em">107MB</td>
+  <td style="font-size:0.85em">apt-get</td>
+  <td style="font-size:0.85em">—</td>
+</tr>
+<tr id="res-7-detail" style="display:none">
+  <td colspan="10" style="background:#f8f9fb;padding:12px">
+    <p style="margin-top:4px;font-size:0.85em;color:#555">Source: <code>manifests/packages.pp</code>:<code>11</code></p>
+    <div style="margin-bottom:8px">
+    <b>Change:</b>
+    <table style="width:100%;margin-top:4px;font-family:monospace;font-size:12px">
+      <tr><th style="width:50%">Before</th><th style="width:50%">After</th></tr>
+      <tr><td style="background:#fff0f0;padding:4px 8px">absent</td>
+          <td style="background:#f0fff0;padding:4px 8px">2:9.0.1672-1ubuntu2</td></tr>
+    </table></div>
+    <p style="margin-top:6px;font-size:0.85em;color:#555">Memory during eval — start: <b>92MB</b> &nbsp; peak: <b>107MB</b> &nbsp; delta: <b style="color:#e84040;font-weight:bold">+14MB</b></p>
+    <b>Parameters (2):</b>
+    <table style="width:100%;margin-bottom:8px;margin-top:4px">
+      <tr><th>Key</th><th>Value</th></tr><tr><td style="font-weight:bold">ensure</td><td style="font-family:monospace;font-size:11px">present</td></tr><tr><td style="font-weight:bold">provider</td><td style="font-family:monospace;font-size:11px">apt</td></tr>
+    </table>
+    <b>Files written (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td colspan="3">none</td></tr>
+    </table>
+    <b>Files read (1):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td>/var/cache/apt/archives/vim_9.0_amd64.deb</td><td>10.0 MB</td><td>1</td></tr>
+    </table>
+    <b>Processes (1):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>PID</th><th>Exe</th><th>Args</th><th>Written</th><th>Read</th></tr><tr><td>99990</td><td>/usr/bin/apt-get</td><td>apt-get -y install vim</td><td>50.0 MB</td><td>10.0 MB</td></tr>
+    </table>
+    <b>Network (0):</b>
+    <table style="width:100%">
+      <tr><th>Remote</th><th>Direction</th></tr><tr><td colspan="2">none</td></tr>
+    </table>
+    <p style="margin-top:6px;color:#888;font-size:0.85em">strace events in window: 28</p>
+  </td>
+</tr><tr onclick="toggleDetail('res-8')" style="cursor:pointer">
+  <td>Package[docker-ce]</td>
+  <td>Package</td>
+  <td><span style="background:#d4edda;color:#1a6b3a;padding:2px 7px;border-radius:3px;font-size:0.8em;font-weight:bold">changed</span></td>
+  <td>4.870s</td>
+  <td>200.0 MB</td>
+  <td>97.7 MB</td>
+  <td style="font-size:0.85em;color:#e84040;font-weight:bold">+24MB</td>
+  <td style="font-size:0.85em">151MB</td>
+  <td style="font-size:0.85em">apt-get</td>
+  <td style="font-size:0.85em">—</td>
+</tr>
+<tr id="res-8-detail" style="display:none">
+  <td colspan="10" style="background:#f8f9fb;padding:12px">
+    <p style="margin-top:4px;font-size:0.85em;color:#555">Source: <code>manifests/packages.pp</code>:<code>38</code></p>
+    
+    <p style="margin-top:6px;font-size:0.85em;color:#555">Memory during eval — start: <b>126MB</b> &nbsp; peak: <b>151MB</b> &nbsp; delta: <b style="color:#e84040;font-weight:bold">+24MB</b></p>
+    <b>Parameters (2):</b>
+    <table style="width:100%;margin-bottom:8px;margin-top:4px">
+      <tr><th>Key</th><th>Value</th></tr><tr><td style="font-weight:bold">ensure</td><td style="font-family:monospace;font-size:11px">present</td></tr><tr><td style="font-weight:bold">provider</td><td style="font-family:monospace;font-size:11px">apt</td></tr>
+    </table>
+    <b>Files written (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td colspan="3">none</td></tr>
+    </table>
+    <b>Files read (2):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td>/var/cache/apt/archives/docker-ce_24.0_amd64.deb</td><td>48.8 MB</td><td>1</td></tr><tr><td>/var/cache/apt/archives/containerd.io_1.6_amd64.deb</td><td>48.8 MB</td><td>1</td></tr>
+    </table>
+    <b>Processes (1):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>PID</th><th>Exe</th><th>Args</th><th>Written</th><th>Read</th></tr><tr><td>99990</td><td>/usr/bin/apt-get</td><td>apt-get -y install docker-ce</td><td>200.0 MB</td><td>97.7 MB</td></tr>
+    </table>
+    <b>Network (0):</b>
+    <table style="width:100%">
+      <tr><th>Remote</th><th>Direction</th></tr><tr><td colspan="2">none</td></tr>
+    </table>
+    <p style="margin-top:6px;color:#888;font-size:0.85em">strace events in window: 73</p>
+  </td>
+</tr><tr onclick="toggleDetail('res-9')" style="cursor:pointer">
+  <td>Package[curl]</td>
+  <td>Package</td>
+  <td><span style="background:#eee;color:#555;padding:2px 7px;border-radius:3px;font-size:0.8em;font-weight:bold">unchanged</span></td>
+  <td>0.020s</td>
+  <td>0.0 B</td>
+  <td>0.0 B</td>
+  <td style="font-size:0.85em;">+0MB</td>
+  <td style="font-size:0.85em">92MB</td>
+  <td style="font-size:0.85em">—</td>
+  <td style="font-size:0.85em">—</td>
+</tr>
+<tr id="res-9-detail" style="display:none">
+  <td colspan="10" style="background:#f8f9fb;padding:12px">
+    <p style="margin-top:4px;font-size:0.85em;color:#555">Source: <code>manifests/packages.pp</code>:<code>11</code></p>
+    
+    <p style="margin-top:6px;font-size:0.85em;color:#555">Memory during eval — start: <b>92MB</b> &nbsp; peak: <b>92MB</b> &nbsp; delta: <b style="">+0MB</b></p>
+    <b>Parameters (1):</b>
+    <table style="width:100%;margin-bottom:8px;margin-top:4px">
+      <tr><th>Key</th><th>Value</th></tr><tr><td style="font-weight:bold">ensure</td><td style="font-family:monospace;font-size:11px">present</td></tr>
+    </table>
+    <b>Files written (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td colspan="3">none</td></tr>
+    </table>
+    <b>Files read (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td colspan="3">none</td></tr>
+    </table>
+    <b>Processes (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>PID</th><th>Exe</th><th>Args</th><th>Written</th><th>Read</th></tr><tr><td colspan="5">none</td></tr>
+    </table>
+    <b>Network (0):</b>
+    <table style="width:100%">
+      <tr><th>Remote</th><th>Direction</th></tr><tr><td colspan="2">none</td></tr>
+    </table>
+    <p style="margin-top:6px;color:#888;font-size:0.85em">strace events in window: 2</p>
+  </td>
+</tr><tr onclick="toggleDetail('res-10')" style="cursor:pointer">
+  <td>Package[wget]</td>
+  <td>Package</td>
+  <td><span style="background:#eee;color:#555;padding:2px 7px;border-radius:3px;font-size:0.8em;font-weight:bold">unchanged</span></td>
+  <td>0.020s</td>
+  <td>0.0 B</td>
+  <td>0.0 B</td>
+  <td style="font-size:0.85em;">+0MB</td>
+  <td style="font-size:0.85em">92MB</td>
+  <td style="font-size:0.85em">—</td>
+  <td style="font-size:0.85em">—</td>
+</tr>
+<tr id="res-10-detail" style="display:none">
+  <td colspan="10" style="background:#f8f9fb;padding:12px">
+    <p style="margin-top:4px;font-size:0.85em;color:#555">Source: <code>manifests/packages.pp</code>:<code>11</code></p>
+    
+    <p style="margin-top:6px;font-size:0.85em;color:#555">Memory during eval — start: <b>92MB</b> &nbsp; peak: <b>92MB</b> &nbsp; delta: <b style="">+0MB</b></p>
+    <b>Parameters (1):</b>
+    <table style="width:100%;margin-bottom:8px;margin-top:4px">
+      <tr><th>Key</th><th>Value</th></tr><tr><td style="font-weight:bold">ensure</td><td style="font-family:monospace;font-size:11px">present</td></tr>
+    </table>
+    <b>Files written (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td colspan="3">none</td></tr>
+    </table>
+    <b>Files read (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td colspan="3">none</td></tr>
+    </table>
+    <b>Processes (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>PID</th><th>Exe</th><th>Args</th><th>Written</th><th>Read</th></tr><tr><td colspan="5">none</td></tr>
+    </table>
+    <b>Network (0):</b>
+    <table style="width:100%">
+      <tr><th>Remote</th><th>Direction</th></tr><tr><td colspan="2">none</td></tr>
+    </table>
+    <p style="margin-top:6px;color:#888;font-size:0.85em">strace events in window: 2</p>
+  </td>
+</tr><tr onclick="toggleDetail('res-11')" style="cursor:pointer">
+  <td>Package[git]</td>
+  <td>Package</td>
+  <td><span style="background:#eee;color:#555;padding:2px 7px;border-radius:3px;font-size:0.8em;font-weight:bold">unchanged</span></td>
+  <td>0.020s</td>
+  <td>0.0 B</td>
+  <td>0.0 B</td>
+  <td style="font-size:0.85em;">+0MB</td>
+  <td style="font-size:0.85em">92MB</td>
+  <td style="font-size:0.85em">—</td>
+  <td style="font-size:0.85em">—</td>
+</tr>
+<tr id="res-11-detail" style="display:none">
+  <td colspan="10" style="background:#f8f9fb;padding:12px">
+    <p style="margin-top:4px;font-size:0.85em;color:#555">Source: <code>manifests/packages.pp</code>:<code>11</code></p>
+    
+    <p style="margin-top:6px;font-size:0.85em;color:#555">Memory during eval — start: <b>92MB</b> &nbsp; peak: <b>92MB</b> &nbsp; delta: <b style="">+0MB</b></p>
+    <b>Parameters (1):</b>
+    <table style="width:100%;margin-bottom:8px;margin-top:4px">
+      <tr><th>Key</th><th>Value</th></tr><tr><td style="font-weight:bold">ensure</td><td style="font-family:monospace;font-size:11px">present</td></tr>
+    </table>
+    <b>Files written (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td colspan="3">none</td></tr>
+    </table>
+    <b>Files read (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td colspan="3">none</td></tr>
+    </table>
+    <b>Processes (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>PID</th><th>Exe</th><th>Args</th><th>Written</th><th>Read</th></tr><tr><td colspan="5">none</td></tr>
+    </table>
+    <b>Network (0):</b>
+    <table style="width:100%">
+      <tr><th>Remote</th><th>Direction</th></tr><tr><td colspan="2">none</td></tr>
+    </table>
+    <p style="margin-top:6px;color:#888;font-size:0.85em">strace events in window: 2</p>
+  </td>
+</tr><tr onclick="toggleDetail('res-12')" style="cursor:pointer">
+  <td>Service[nginx]</td>
+  <td>Service</td>
+  <td><span style="background:#d4edda;color:#1a6b3a;padding:2px 7px;border-radius:3px;font-size:0.8em;font-weight:bold">changed</span></td>
+  <td>0.450s</td>
+  <td>0.0 B</td>
+  <td>0.0 B</td>
+  <td style="font-size:0.85em;">+4MB</td>
+  <td style="font-size:0.85em">112MB</td>
+  <td style="font-size:0.85em">systemctl</td>
+  <td style="font-size:0.85em">—</td>
+</tr>
+<tr id="res-12-detail" style="display:none">
+  <td colspan="10" style="background:#f8f9fb;padding:12px">
+    <p style="margin-top:4px;font-size:0.85em;color:#555">Source: <code>manifests/services.pp</code>:<code>17</code></p>
+    <div style="margin-bottom:8px">
+    <b>Change:</b>
+    <table style="width:100%;margin-top:4px;font-family:monospace;font-size:12px">
+      <tr><th style="width:50%">Before</th><th style="width:50%">After</th></tr>
+      <tr><td style="background:#fff0f0;padding:4px 8px">stopped</td>
+          <td style="background:#f0fff0;padding:4px 8px">running</td></tr>
+    </table></div>
+    <p style="margin-top:6px;font-size:0.85em;color:#555">Memory during eval — start: <b>107MB</b> &nbsp; peak: <b>112MB</b> &nbsp; delta: <b style="">+4MB</b></p>
+    <b>Parameters (3):</b>
+    <table style="width:100%;margin-bottom:8px;margin-top:4px">
+      <tr><th>Key</th><th>Value</th></tr><tr><td style="font-weight:bold">ensure</td><td style="font-family:monospace;font-size:11px">running</td></tr><tr><td style="font-weight:bold">require</td><td style="font-family:monospace;font-size:11px">Package[nginx]</td></tr><tr><td style="font-weight:normal">enable</td><td style="font-family:monospace;font-size:11px">True</td></tr>
+    </table>
+    <b>Files written (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td colspan="3">none</td></tr>
+    </table>
+    <b>Files read (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td colspan="3">none</td></tr>
+    </table>
+    <b>Processes (1):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>PID</th><th>Exe</th><th>Args</th><th>Written</th><th>Read</th></tr><tr><td>99990</td><td>/usr/bin/systemctl</td><td>systemctl enable --now nginx</td><td>0.0 B</td><td>0.0 B</td></tr>
+    </table>
+    <b>Network (0):</b>
+    <table style="width:100%">
+      <tr><th>Remote</th><th>Direction</th></tr><tr><td colspan="2">none</td></tr>
+    </table>
+    <p style="margin-top:6px;color:#888;font-size:0.85em">strace events in window: 6</p>
+  </td>
+</tr><tr onclick="toggleDetail('res-13')" style="cursor:pointer">
+  <td>File[/etc/nginx/sites-enabled/default]</td>
+  <td>File</td>
+  <td><span style="background:#eee;color:#555;padding:2px 7px;border-radius:3px;font-size:0.8em;font-weight:bold">unchanged</span></td>
+  <td>0.050s</td>
+  <td>0.0 B</td>
+  <td>0.0 B</td>
+  <td style="font-size:0.85em;">+0MB</td>
+  <td style="font-size:0.85em">112MB</td>
+  <td style="font-size:0.85em">—</td>
+  <td style="font-size:0.85em">—</td>
+</tr>
+<tr id="res-13-detail" style="display:none">
+  <td colspan="10" style="background:#f8f9fb;padding:12px">
+    <p style="margin-top:4px;font-size:0.85em;color:#555">Source: <code>manifests/files.pp</code>:<code>19</code></p>
+    
+    <p style="margin-top:6px;font-size:0.85em;color:#555">Memory during eval — start: <b>112MB</b> &nbsp; peak: <b>112MB</b> &nbsp; delta: <b style="">+0MB</b></p>
+    <b>Parameters (2):</b>
+    <table style="width:100%;margin-bottom:8px;margin-top:4px">
+      <tr><th>Key</th><th>Value</th></tr><tr><td style="font-weight:bold">ensure</td><td style="font-family:monospace;font-size:11px">link</td></tr><tr><td style="font-weight:bold">target</td><td style="font-family:monospace;font-size:11px">/etc/nginx/sites-available/default</td></tr>
+    </table>
+    <b>Files written (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td colspan="3">none</td></tr>
+    </table>
+    <b>Files read (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td colspan="3">none</td></tr>
+    </table>
+    <b>Processes (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>PID</th><th>Exe</th><th>Args</th><th>Written</th><th>Read</th></tr><tr><td colspan="5">none</td></tr>
+    </table>
+    <b>Network (0):</b>
+    <table style="width:100%">
+      <tr><th>Remote</th><th>Direction</th></tr><tr><td colspan="2">none</td></tr>
+    </table>
+    <p style="margin-top:6px;color:#888;font-size:0.85em">strace events in window: 2</p>
+  </td>
+</tr><tr onclick="toggleDetail('res-14')" style="cursor:pointer">
+  <td>User[deploy]</td>
+  <td>User</td>
+  <td><span style="background:#d4edda;color:#1a6b3a;padding:2px 7px;border-radius:3px;font-size:0.8em;font-weight:bold">changed</span></td>
+  <td>0.140s</td>
+  <td>0.0 B</td>
+  <td>0.0 B</td>
+  <td style="font-size:0.85em;">+0MB</td>
+  <td style="font-size:0.85em">112MB</td>
+  <td style="font-size:0.85em">useradd</td>
+  <td style="font-size:0.85em">—</td>
+</tr>
+<tr id="res-14-detail" style="display:none">
+  <td colspan="10" style="background:#f8f9fb;padding:12px">
+    <p style="margin-top:4px;font-size:0.85em;color:#555">Source: <code>manifests/users.pp</code>:<code>19</code></p>
+    
+    <p style="margin-top:6px;font-size:0.85em;color:#555">Memory during eval — start: <b>112MB</b> &nbsp; peak: <b>112MB</b> &nbsp; delta: <b style="">+0MB</b></p>
+    <b>Parameters (6):</b>
+    <table style="width:100%;margin-bottom:8px;margin-top:4px">
+      <tr><th>Key</th><th>Value</th></tr><tr><td style="font-weight:bold">ensure</td><td style="font-family:monospace;font-size:11px">present</td></tr><tr><td style="font-weight:normal">gid</td><td style="font-family:monospace;font-size:11px">2001</td></tr><tr><td style="font-weight:normal">home</td><td style="font-family:monospace;font-size:11px">/home/deploy</td></tr><tr><td style="font-weight:normal">managehome</td><td style="font-family:monospace;font-size:11px">True</td></tr><tr><td style="font-weight:normal">shell</td><td style="font-family:monospace;font-size:11px">/bin/bash</td></tr><tr><td style="font-weight:normal">uid</td><td style="font-family:monospace;font-size:11px">2001</td></tr>
+    </table>
+    <b>Files written (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td colspan="3">none</td></tr>
+    </table>
+    <b>Files read (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td colspan="3">none</td></tr>
+    </table>
+    <b>Processes (1):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>PID</th><th>Exe</th><th>Args</th><th>Written</th><th>Read</th></tr><tr><td>99990</td><td>/usr/sbin/useradd</td><td>useradd -m deploy</td><td>0.0 B</td><td>0.0 B</td></tr>
+    </table>
+    <b>Network (0):</b>
+    <table style="width:100%">
+      <tr><th>Remote</th><th>Direction</th></tr><tr><td colspan="2">none</td></tr>
+    </table>
+    <p style="margin-top:6px;color:#888;font-size:0.85em">strace events in window: 2</p>
+  </td>
+</tr><tr onclick="toggleDetail('res-15')" style="cursor:pointer">
+  <td>Group[deploy]</td>
+  <td>Group</td>
+  <td><span style="background:#eee;color:#555;padding:2px 7px;border-radius:3px;font-size:0.8em;font-weight:bold">unchanged</span></td>
+  <td>0.080s</td>
+  <td>0.0 B</td>
+  <td>0.0 B</td>
+  <td style="font-size:0.85em;">+0MB</td>
+  <td style="font-size:0.85em">112MB</td>
+  <td style="font-size:0.85em">—</td>
+  <td style="font-size:0.85em">—</td>
+</tr>
+<tr id="res-15-detail" style="display:none">
+  <td colspan="10" style="background:#f8f9fb;padding:12px">
+    <p style="margin-top:4px;font-size:0.85em;color:#555">Source: <code>manifests/groups.pp</code>:<code>19</code></p>
+    
+    <p style="margin-top:6px;font-size:0.85em;color:#555">Memory during eval — start: <b>112MB</b> &nbsp; peak: <b>112MB</b> &nbsp; delta: <b style="">+0MB</b></p>
+    <b>Parameters (2):</b>
+    <table style="width:100%;margin-bottom:8px;margin-top:4px">
+      <tr><th>Key</th><th>Value</th></tr><tr><td style="font-weight:bold">ensure</td><td style="font-family:monospace;font-size:11px">present</td></tr><tr><td style="font-weight:normal">gid</td><td style="font-family:monospace;font-size:11px">2001</td></tr>
+    </table>
+    <b>Files written (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td colspan="3">none</td></tr>
+    </table>
+    <b>Files read (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td colspan="3">none</td></tr>
+    </table>
+    <b>Processes (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>PID</th><th>Exe</th><th>Args</th><th>Written</th><th>Read</th></tr><tr><td colspan="5">none</td></tr>
+    </table>
+    <b>Network (0):</b>
+    <table style="width:100%">
+      <tr><th>Remote</th><th>Direction</th></tr><tr><td colspan="2">none</td></tr>
+    </table>
+    <p style="margin-top:6px;color:#888;font-size:0.85em">strace events in window: 2</p>
+  </td>
+</tr><tr onclick="toggleDetail('res-16')" style="cursor:pointer">
+  <td>File[/etc/security/limits.conf]</td>
+  <td>File</td>
+  <td><span style="background:#eee;color:#555;padding:2px 7px;border-radius:3px;font-size:0.8em;font-weight:bold">unchanged</span></td>
+  <td>0.040s</td>
+  <td>0.0 B</td>
+  <td>0.0 B</td>
+  <td style="font-size:0.85em;">+0MB</td>
+  <td style="font-size:0.85em">112MB</td>
+  <td style="font-size:0.85em">—</td>
+  <td style="font-size:0.85em">—</td>
+</tr>
+<tr id="res-16-detail" style="display:none">
+  <td colspan="10" style="background:#f8f9fb;padding:12px">
+    <p style="margin-top:4px;font-size:0.85em;color:#555">Source: <code>manifests/files.pp</code>:<code>20</code></p>
+    
+    <p style="margin-top:6px;font-size:0.85em;color:#555">Memory during eval — start: <b>112MB</b> &nbsp; peak: <b>112MB</b> &nbsp; delta: <b style="">+0MB</b></p>
+    <b>Parameters (3):</b>
+    <table style="width:100%;margin-bottom:8px;margin-top:4px">
+      <tr><th>Key</th><th>Value</th></tr><tr><td style="font-weight:bold">ensure</td><td style="font-family:monospace;font-size:11px">file</td></tr><tr><td style="font-weight:bold">mode</td><td style="font-family:monospace;font-size:11px">0644</td></tr><tr><td style="font-weight:bold">owner</td><td style="font-family:monospace;font-size:11px">root</td></tr>
+    </table>
+    <b>Files written (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td colspan="3">none</td></tr>
+    </table>
+    <b>Files read (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td colspan="3">none</td></tr>
+    </table>
+    <b>Processes (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>PID</th><th>Exe</th><th>Args</th><th>Written</th><th>Read</th></tr><tr><td colspan="5">none</td></tr>
+    </table>
+    <b>Network (0):</b>
+    <table style="width:100%">
+      <tr><th>Remote</th><th>Direction</th></tr><tr><td colspan="2">none</td></tr>
+    </table>
+    <p style="margin-top:6px;color:#888;font-size:0.85em">strace events in window: 2</p>
+  </td>
+</tr><tr onclick="toggleDetail('res-17')" style="cursor:pointer">
+  <td>Exec[sysctl -p]</td>
+  <td>Exec</td>
+  <td><span style="background:#d4edda;color:#1a6b3a;padding:2px 7px;border-radius:3px;font-size:0.8em;font-weight:bold">changed</span></td>
+  <td>0.220s</td>
+  <td>0.0 B</td>
+  <td>0.0 B</td>
+  <td style="font-size:0.85em;">+0MB</td>
+  <td style="font-size:0.85em">112MB</td>
+  <td style="font-size:0.85em">sysctl</td>
+  <td style="font-size:0.85em">—</td>
+</tr>
+<tr id="res-17-detail" style="display:none">
+  <td colspan="10" style="background:#f8f9fb;padding:12px">
+    <p style="margin-top:4px;font-size:0.85em;color:#555">Source: <code>manifests/execs.pp</code>:<code>20</code></p>
+    
+    <p style="margin-top:6px;font-size:0.85em;color:#555">Memory during eval — start: <b>112MB</b> &nbsp; peak: <b>112MB</b> &nbsp; delta: <b style="">+0MB</b></p>
+    <b>Parameters (3):</b>
+    <table style="width:100%;margin-bottom:8px;margin-top:4px">
+      <tr><th>Key</th><th>Value</th></tr><tr><td style="font-weight:bold">command</td><td style="font-family:monospace;font-size:11px">/sbin/sysctl -p</td></tr><tr><td style="font-weight:bold">subscribe</td><td style="font-family:monospace;font-size:11px">File[/etc/sysctl.d/99-custom.conf]</td></tr><tr><td style="font-weight:normal">refreshonly</td><td style="font-family:monospace;font-size:11px">True</td></tr>
+    </table>
+    <b>Files written (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td colspan="3">none</td></tr>
+    </table>
+    <b>Files read (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td colspan="3">none</td></tr>
+    </table>
+    <b>Processes (1):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>PID</th><th>Exe</th><th>Args</th><th>Written</th><th>Read</th></tr><tr><td>99990</td><td>/sbin/sysctl</td><td>sysctl -p</td><td>0.0 B</td><td>0.0 B</td></tr>
+    </table>
+    <b>Network (0):</b>
+    <table style="width:100%">
+      <tr><th>Remote</th><th>Direction</th></tr><tr><td colspan="2">none</td></tr>
+    </table>
+    <p style="margin-top:6px;color:#888;font-size:0.85em">strace events in window: 3</p>
+  </td>
+</tr><tr onclick="toggleDetail('res-18')" style="cursor:pointer">
+  <td>Package[prometheus-node-exporter]</td>
+  <td>Package</td>
+  <td><span style="background:#d4edda;color:#1a6b3a;padding:2px 7px;border-radius:3px;font-size:0.8em;font-weight:bold">changed</span></td>
+  <td>3.210s</td>
+  <td>0.0 B</td>
+  <td>27.3 MB</td>
+  <td style="font-size:0.85em;">+6MB</td>
+  <td style="font-size:0.85em">118MB</td>
+  <td style="font-size:0.85em">apt-get</td>
+  <td style="font-size:0.85em">—</td>
+</tr>
+<tr id="res-18-detail" style="display:none">
+  <td colspan="10" style="background:#f8f9fb;padding:12px">
+    <p style="margin-top:4px;font-size:0.85em;color:#555">Source: <code>manifests/packages.pp</code>:<code>21</code></p>
+    
+    <p style="margin-top:6px;font-size:0.85em;color:#555">Memory during eval — start: <b>112MB</b> &nbsp; peak: <b>118MB</b> &nbsp; delta: <b style="">+6MB</b></p>
+    <b>Parameters (2):</b>
+    <table style="width:100%;margin-bottom:8px;margin-top:4px">
+      <tr><th>Key</th><th>Value</th></tr><tr><td style="font-weight:bold">ensure</td><td style="font-family:monospace;font-size:11px">present</td></tr><tr><td style="font-weight:bold">provider</td><td style="font-family:monospace;font-size:11px">apt</td></tr>
+    </table>
+    <b>Files written (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td colspan="3">none</td></tr>
+    </table>
+    <b>Files read (1):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td>/var/cache/apt/archives/prometheus-node-exporter_1.7_amd64.deb</td><td>27.3 MB</td><td>1</td></tr>
+    </table>
+    <b>Processes (1):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>PID</th><th>Exe</th><th>Args</th><th>Written</th><th>Read</th></tr><tr><td>99990</td><td>/usr/bin/apt-get</td><td>apt-get -y install prometheus-node-exporter</td><td>0.0 B</td><td>27.3 MB</td></tr>
+    </table>
+    <b>Network (0):</b>
+    <table style="width:100%">
+      <tr><th>Remote</th><th>Direction</th></tr><tr><td colspan="2">none</td></tr>
+    </table>
+    <p style="margin-top:6px;color:#888;font-size:0.85em">strace events in window: 48</p>
+  </td>
+</tr><tr onclick="toggleDetail('res-19')" style="cursor:pointer">
+  <td>Service[prometheus-node-exporter]</td>
+  <td>Service</td>
+  <td><span style="background:#eee;color:#555;padding:2px 7px;border-radius:3px;font-size:0.8em;font-weight:bold">unchanged</span></td>
+  <td>0.550s</td>
+  <td>0.0 B</td>
+  <td>0.0 B</td>
+  <td style="font-size:0.85em;">+4MB</td>
+  <td style="font-size:0.85em">122MB</td>
+  <td style="font-size:0.85em">—</td>
+  <td style="font-size:0.85em">—</td>
+</tr>
+<tr id="res-19-detail" style="display:none">
+  <td colspan="10" style="background:#f8f9fb;padding:12px">
+    <p style="margin-top:4px;font-size:0.85em;color:#555">Source: <code>manifests/services.pp</code>:<code>30</code></p>
+    
+    <p style="margin-top:6px;font-size:0.85em;color:#555">Memory during eval — start: <b>118MB</b> &nbsp; peak: <b>122MB</b> &nbsp; delta: <b style="">+4MB</b></p>
+    <b>Parameters (2):</b>
+    <table style="width:100%;margin-bottom:8px;margin-top:4px">
+      <tr><th>Key</th><th>Value</th></tr><tr><td style="font-weight:bold">ensure</td><td style="font-family:monospace;font-size:11px">running</td></tr><tr><td style="font-weight:normal">enable</td><td style="font-family:monospace;font-size:11px">True</td></tr>
+    </table>
+    <b>Files written (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td colspan="3">none</td></tr>
+    </table>
+    <b>Files read (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td colspan="3">none</td></tr>
+    </table>
+    <b>Processes (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>PID</th><th>Exe</th><th>Args</th><th>Written</th><th>Read</th></tr><tr><td colspan="5">none</td></tr>
+    </table>
+    <b>Network (0):</b>
+    <table style="width:100%">
+      <tr><th>Remote</th><th>Direction</th></tr><tr><td colspan="2">none</td></tr>
+    </table>
+    <p style="margin-top:6px;color:#888;font-size:0.85em">strace events in window: 8</p>
+  </td>
+</tr><tr onclick="toggleDetail('res-20')" style="cursor:pointer">
+  <td>File[/etc/default/prometheus-node-exporter]</td>
+  <td>File</td>
+  <td><span style="background:#eee;color:#555;padding:2px 7px;border-radius:3px;font-size:0.8em;font-weight:bold">unchanged</span></td>
+  <td>0.040s</td>
+  <td>0.0 B</td>
+  <td>0.0 B</td>
+  <td style="font-size:0.85em;">+0MB</td>
+  <td style="font-size:0.85em">123MB</td>
+  <td style="font-size:0.85em">—</td>
+  <td style="font-size:0.85em">—</td>
+</tr>
+<tr id="res-20-detail" style="display:none">
+  <td colspan="10" style="background:#f8f9fb;padding:12px">
+    <p style="margin-top:4px;font-size:0.85em;color:#555">Source: <code>manifests/files.pp</code>:<code>32</code></p>
+    
+    <p style="margin-top:6px;font-size:0.85em;color:#555">Memory during eval — start: <b>123MB</b> &nbsp; peak: <b>123MB</b> &nbsp; delta: <b style="">+0MB</b></p>
+    <b>Parameters (3):</b>
+    <table style="width:100%;margin-bottom:8px;margin-top:4px">
+      <tr><th>Key</th><th>Value</th></tr><tr><td style="font-weight:bold">ensure</td><td style="font-family:monospace;font-size:11px">file</td></tr><tr><td style="font-weight:bold">mode</td><td style="font-family:monospace;font-size:11px">0644</td></tr><tr><td style="font-weight:bold">owner</td><td style="font-family:monospace;font-size:11px">root</td></tr>
+    </table>
+    <b>Files written (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td colspan="3">none</td></tr>
+    </table>
+    <b>Files read (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td colspan="3">none</td></tr>
+    </table>
+    <b>Processes (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>PID</th><th>Exe</th><th>Args</th><th>Written</th><th>Read</th></tr><tr><td colspan="5">none</td></tr>
+    </table>
+    <b>Network (0):</b>
+    <table style="width:100%">
+      <tr><th>Remote</th><th>Direction</th></tr><tr><td colspan="2">none</td></tr>
+    </table>
+    <p style="margin-top:6px;color:#888;font-size:0.85em">strace events in window: 2</p>
+  </td>
+</tr><tr onclick="toggleDetail('res-21')" style="cursor:pointer">
+  <td>Package[rsyslog]</td>
+  <td>Package</td>
+  <td><span style="background:#eee;color:#555;padding:2px 7px;border-radius:3px;font-size:0.8em;font-weight:bold">unchanged</span></td>
+  <td>0.020s</td>
+  <td>0.0 B</td>
+  <td>0.0 B</td>
+  <td style="font-size:0.85em;">+0MB</td>
+  <td style="font-size:0.85em">123MB</td>
+  <td style="font-size:0.85em">—</td>
+  <td style="font-size:0.85em">—</td>
+</tr>
+<tr id="res-21-detail" style="display:none">
+  <td colspan="10" style="background:#f8f9fb;padding:12px">
+    <p style="margin-top:4px;font-size:0.85em;color:#555">Source: <code>manifests/packages.pp</code>:<code>32</code></p>
+    
+    <p style="margin-top:6px;font-size:0.85em;color:#555">Memory during eval — start: <b>123MB</b> &nbsp; peak: <b>123MB</b> &nbsp; delta: <b style="">+0MB</b></p>
+    <b>Parameters (1):</b>
+    <table style="width:100%;margin-bottom:8px;margin-top:4px">
+      <tr><th>Key</th><th>Value</th></tr><tr><td style="font-weight:bold">ensure</td><td style="font-family:monospace;font-size:11px">present</td></tr>
+    </table>
+    <b>Files written (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td colspan="3">none</td></tr>
+    </table>
+    <b>Files read (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td colspan="3">none</td></tr>
+    </table>
+    <b>Processes (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>PID</th><th>Exe</th><th>Args</th><th>Written</th><th>Read</th></tr><tr><td colspan="5">none</td></tr>
+    </table>
+    <b>Network (0):</b>
+    <table style="width:100%">
+      <tr><th>Remote</th><th>Direction</th></tr><tr><td colspan="2">none</td></tr>
+    </table>
+    <p style="margin-top:6px;color:#888;font-size:0.85em">strace events in window: 2</p>
+  </td>
+</tr><tr onclick="toggleDetail('res-22')" style="cursor:pointer">
+  <td>Service[rsyslog]</td>
+  <td>Service</td>
+  <td><span style="background:#eee;color:#555;padding:2px 7px;border-radius:3px;font-size:0.8em;font-weight:bold">unchanged</span></td>
+  <td>0.410s</td>
+  <td>0.0 B</td>
+  <td>0.0 B</td>
+  <td style="font-size:0.85em;">+2MB</td>
+  <td style="font-size:0.85em">126MB</td>
+  <td style="font-size:0.85em">—</td>
+  <td style="font-size:0.85em">—</td>
+</tr>
+<tr id="res-22-detail" style="display:none">
+  <td colspan="10" style="background:#f8f9fb;padding:12px">
+    <p style="margin-top:4px;font-size:0.85em;color:#555">Source: <code>manifests/services.pp</code>:<code>32</code></p>
+    
+    <p style="margin-top:6px;font-size:0.85em;color:#555">Memory during eval — start: <b>124MB</b> &nbsp; peak: <b>126MB</b> &nbsp; delta: <b style="">+2MB</b></p>
+    <b>Parameters (3):</b>
+    <table style="width:100%;margin-bottom:8px;margin-top:4px">
+      <tr><th>Key</th><th>Value</th></tr><tr><td style="font-weight:bold">ensure</td><td style="font-family:monospace;font-size:11px">running</td></tr><tr><td style="font-weight:bold">subscribe</td><td style="font-family:monospace;font-size:11px">File[/etc/rsyslog.conf]</td></tr><tr><td style="font-weight:normal">enable</td><td style="font-family:monospace;font-size:11px">True</td></tr>
+    </table>
+    <b>Files written (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td colspan="3">none</td></tr>
+    </table>
+    <b>Files read (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td colspan="3">none</td></tr>
+    </table>
+    <b>Processes (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>PID</th><th>Exe</th><th>Args</th><th>Written</th><th>Read</th></tr><tr><td colspan="5">none</td></tr>
+    </table>
+    <b>Network (0):</b>
+    <table style="width:100%">
+      <tr><th>Remote</th><th>Direction</th></tr><tr><td colspan="2">none</td></tr>
+    </table>
+    <p style="margin-top:6px;color:#888;font-size:0.85em">strace events in window: 6</p>
+  </td>
+</tr><tr onclick="toggleDetail('res-23')" style="cursor:pointer">
+  <td>Cron[backup-daily]</td>
+  <td>Cron</td>
+  <td><span style="background:#d4edda;color:#1a6b3a;padding:2px 7px;border-radius:3px;font-size:0.8em;font-weight:bold">changed</span></td>
+  <td>0.070s</td>
+  <td>0.0 B</td>
+  <td>0.0 B</td>
+  <td style="font-size:0.85em;">+0MB</td>
+  <td style="font-size:0.85em">126MB</td>
+  <td style="font-size:0.85em">—</td>
+  <td style="font-size:0.85em">—</td>
+</tr>
+<tr id="res-23-detail" style="display:none">
+  <td colspan="10" style="background:#f8f9fb;padding:12px">
+    <p style="margin-top:4px;font-size:0.85em;color:#555">Source: <code>manifests/crons.pp</code>:<code>34</code></p>
+    
+    <p style="margin-top:6px;font-size:0.85em;color:#555">Memory during eval — start: <b>126MB</b> &nbsp; peak: <b>126MB</b> &nbsp; delta: <b style="">+0MB</b></p>
+    <b>Parameters (5):</b>
+    <table style="width:100%;margin-bottom:8px;margin-top:4px">
+      <tr><th>Key</th><th>Value</th></tr><tr><td style="font-weight:bold">command</td><td style="font-family:monospace;font-size:11px">/usr/local/bin/backup.sh</td></tr><tr><td style="font-weight:bold">ensure</td><td style="font-family:monospace;font-size:11px">present</td></tr><tr><td style="font-weight:normal">hour</td><td style="font-family:monospace;font-size:11px">2</td></tr><tr><td style="font-weight:normal">minute</td><td style="font-family:monospace;font-size:11px">30</td></tr><tr><td style="font-weight:normal">user</td><td style="font-family:monospace;font-size:11px">root</td></tr>
+    </table>
+    <b>Files written (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td colspan="3">none</td></tr>
+    </table>
+    <b>Files read (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td colspan="3">none</td></tr>
+    </table>
+    <b>Processes (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>PID</th><th>Exe</th><th>Args</th><th>Written</th><th>Read</th></tr><tr><td colspan="5">none</td></tr>
+    </table>
+    <b>Network (0):</b>
+    <table style="width:100%">
+      <tr><th>Remote</th><th>Direction</th></tr><tr><td colspan="2">none</td></tr>
+    </table>
+    <p style="margin-top:6px;color:#888;font-size:0.85em">strace events in window: 2</p>
+  </td>
+</tr><tr onclick="toggleDetail('res-24')" style="cursor:pointer">
+  <td>Exec[iptables-restore]</td>
+  <td>Exec</td>
+  <td><span style="background:#eee;color:#555;padding:2px 7px;border-radius:3px;font-size:0.8em;font-weight:bold">unchanged</span></td>
+  <td>0.180s</td>
+  <td>0.0 B</td>
+  <td>0.0 B</td>
+  <td style="font-size:0.85em;">+0MB</td>
+  <td style="font-size:0.85em">126MB</td>
+  <td style="font-size:0.85em">iptables-restore</td>
+  <td style="font-size:0.85em">—</td>
+</tr>
+<tr id="res-24-detail" style="display:none">
+  <td colspan="10" style="background:#f8f9fb;padding:12px">
+    <p style="margin-top:4px;font-size:0.85em;color:#555">Source: <code>manifests/execs.pp</code>:<code>34</code></p>
+    
+    <p style="margin-top:6px;font-size:0.85em;color:#555">Memory during eval — start: <b>126MB</b> &nbsp; peak: <b>126MB</b> &nbsp; delta: <b style="">+0MB</b></p>
+    <b>Parameters (2):</b>
+    <table style="width:100%;margin-bottom:8px;margin-top:4px">
+      <tr><th>Key</th><th>Value</th></tr><tr><td style="font-weight:bold">command</td><td style="font-family:monospace;font-size:11px">/usr/sbin/iptables-restore /etc/iptables/rules.v4</td></tr><tr><td style="font-weight:normal">refreshonly</td><td style="font-family:monospace;font-size:11px">True</td></tr>
+    </table>
+    <b>Files written (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td colspan="3">none</td></tr>
+    </table>
+    <b>Files read (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td colspan="3">none</td></tr>
+    </table>
+    <b>Processes (1):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>PID</th><th>Exe</th><th>Args</th><th>Written</th><th>Read</th></tr><tr><td>99990</td><td>/usr/sbin/iptables-restore</td><td>iptables-restore /etc/iptables/rules.v4</td><td>0.0 B</td><td>0.0 B</td></tr>
+    </table>
+    <b>Network (0):</b>
+    <table style="width:100%">
+      <tr><th>Remote</th><th>Direction</th></tr><tr><td colspan="2">none</td></tr>
+    </table>
+    <p style="margin-top:6px;color:#888;font-size:0.85em">strace events in window: 2</p>
+  </td>
+</tr><tr onclick="toggleDetail('res-25')" style="cursor:pointer">
+  <td>File[/etc/iptables/rules.v4]</td>
+  <td>File</td>
+  <td><span style="background:#d4edda;color:#1a6b3a;padding:2px 7px;border-radius:3px;font-size:0.8em;font-weight:bold">changed</span></td>
+  <td>0.090s</td>
+  <td>2.0 KB</td>
+  <td>0.0 B</td>
+  <td style="font-size:0.85em;">+0MB</td>
+  <td style="font-size:0.85em">126MB</td>
+  <td style="font-size:0.85em">—</td>
+  <td style="font-size:0.85em">/etc/iptables/rules.v4</td>
+</tr>
+<tr id="res-25-detail" style="display:none">
+  <td colspan="10" style="background:#f8f9fb;padding:12px">
+    <p style="margin-top:4px;font-size:0.85em;color:#555">Source: <code>manifests/files.pp</code>:<code>34</code></p>
+    
+    <p style="margin-top:6px;font-size:0.85em;color:#555">Memory during eval — start: <b>126MB</b> &nbsp; peak: <b>126MB</b> &nbsp; delta: <b style="">+0MB</b></p>
+    <b>Parameters (3):</b>
+    <table style="width:100%;margin-bottom:8px;margin-top:4px">
+      <tr><th>Key</th><th>Value</th></tr><tr><td style="font-weight:bold">ensure</td><td style="font-family:monospace;font-size:11px">file</td></tr><tr><td style="font-weight:bold">mode</td><td style="font-family:monospace;font-size:11px">0640</td></tr><tr><td style="font-weight:bold">owner</td><td style="font-family:monospace;font-size:11px">root</td></tr>
+    </table>
+    <b>Files written (1):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td>/etc/iptables/rules.v4</td><td>2.0 KB</td><td>1</td></tr>
+    </table>
+    <b>Files read (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td colspan="3">none</td></tr>
+    </table>
+    <b>Processes (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>PID</th><th>Exe</th><th>Args</th><th>Written</th><th>Read</th></tr><tr><td colspan="5">none</td></tr>
+    </table>
+    <b>Network (0):</b>
+    <table style="width:100%">
+      <tr><th>Remote</th><th>Direction</th></tr><tr><td colspan="2">none</td></tr>
+    </table>
+    <p style="margin-top:6px;color:#888;font-size:0.85em">strace events in window: 2</p>
+  </td>
+</tr><tr onclick="toggleDetail('res-26')" style="cursor:pointer">
+  <td>File[/etc/ssl/certs/example.crt]</td>
+  <td>File</td>
+  <td><span style="background:#eee;color:#555;padding:2px 7px;border-radius:3px;font-size:0.8em;font-weight:bold">unchanged</span></td>
+  <td>0.110s</td>
+  <td>0.0 B</td>
+  <td>0.0 B</td>
+  <td style="font-size:0.85em;">+0MB</td>
+  <td style="font-size:0.85em">126MB</td>
+  <td style="font-size:0.85em">—</td>
+  <td style="font-size:0.85em">—</td>
+</tr>
+<tr id="res-26-detail" style="display:none">
+  <td colspan="10" style="background:#f8f9fb;padding:12px">
+    <p style="margin-top:4px;font-size:0.85em;color:#555">Source: <code>manifests/files.pp</code>:<code>35</code></p>
+    
+    <p style="margin-top:6px;font-size:0.85em;color:#555">Memory during eval — start: <b>126MB</b> &nbsp; peak: <b>126MB</b> &nbsp; delta: <b style="">+0MB</b></p>
+    <b>Parameters (4):</b>
+    <table style="width:100%;margin-bottom:8px;margin-top:4px">
+      <tr><th>Key</th><th>Value</th></tr><tr><td style="font-weight:bold">ensure</td><td style="font-family:monospace;font-size:11px">file</td></tr><tr><td style="font-weight:bold">group</td><td style="font-family:monospace;font-size:11px">ssl-cert</td></tr><tr><td style="font-weight:bold">mode</td><td style="font-family:monospace;font-size:11px">0644</td></tr><tr><td style="font-weight:bold">owner</td><td style="font-family:monospace;font-size:11px">root</td></tr>
+    </table>
+    <b>Files written (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td colspan="3">none</td></tr>
+    </table>
+    <b>Files read (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td colspan="3">none</td></tr>
+    </table>
+    <b>Processes (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>PID</th><th>Exe</th><th>Args</th><th>Written</th><th>Read</th></tr><tr><td colspan="5">none</td></tr>
+    </table>
+    <b>Network (0):</b>
+    <table style="width:100%">
+      <tr><th>Remote</th><th>Direction</th></tr><tr><td colspan="2">none</td></tr>
+    </table>
+    <p style="margin-top:6px;color:#888;font-size:0.85em">strace events in window: 2</p>
+  </td>
+</tr><tr onclick="toggleDetail('res-27')" style="cursor:pointer">
+  <td>File[/etc/ssl/private/example.key]</td>
+  <td>File</td>
+  <td><span style="background:#eee;color:#555;padding:2px 7px;border-radius:3px;font-size:0.8em;font-weight:bold">unchanged</span></td>
+  <td>0.050s</td>
+  <td>0.0 B</td>
+  <td>0.0 B</td>
+  <td style="font-size:0.85em;">+0MB</td>
+  <td style="font-size:0.85em">126MB</td>
+  <td style="font-size:0.85em">—</td>
+  <td style="font-size:0.85em">—</td>
+</tr>
+<tr id="res-27-detail" style="display:none">
+  <td colspan="10" style="background:#f8f9fb;padding:12px">
+    <p style="margin-top:4px;font-size:0.85em;color:#555">Source: <code>manifests/files.pp</code>:<code>35</code></p>
+    
+    <p style="margin-top:6px;font-size:0.85em;color:#555">Memory during eval — start: <b>126MB</b> &nbsp; peak: <b>126MB</b> &nbsp; delta: <b style="">+0MB</b></p>
+    <b>Parameters (4):</b>
+    <table style="width:100%;margin-bottom:8px;margin-top:4px">
+      <tr><th>Key</th><th>Value</th></tr><tr><td style="font-weight:bold">ensure</td><td style="font-family:monospace;font-size:11px">file</td></tr><tr><td style="font-weight:bold">group</td><td style="font-family:monospace;font-size:11px">ssl-cert</td></tr><tr><td style="font-weight:bold">mode</td><td style="font-family:monospace;font-size:11px">0640</td></tr><tr><td style="font-weight:bold">owner</td><td style="font-family:monospace;font-size:11px">root</td></tr>
+    </table>
+    <b>Files written (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td colspan="3">none</td></tr>
+    </table>
+    <b>Files read (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td colspan="3">none</td></tr>
+    </table>
+    <b>Processes (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>PID</th><th>Exe</th><th>Args</th><th>Written</th><th>Read</th></tr><tr><td colspan="5">none</td></tr>
+    </table>
+    <b>Network (0):</b>
+    <table style="width:100%">
+      <tr><th>Remote</th><th>Direction</th></tr><tr><td colspan="2">none</td></tr>
+    </table>
+    <p style="margin-top:6px;color:#888;font-size:0.85em">strace events in window: 2</p>
+  </td>
+</tr><tr onclick="toggleDetail('res-28')" style="cursor:pointer">
+  <td>Exec[update-ca-certificates]</td>
+  <td>Exec</td>
+  <td><span style="background:#d4edda;color:#1a6b3a;padding:2px 7px;border-radius:3px;font-size:0.8em;font-weight:bold">changed</span></td>
+  <td>0.840s</td>
+  <td>0.0 B</td>
+  <td>0.0 B</td>
+  <td style="font-size:0.85em;">+0MB</td>
+  <td style="font-size:0.85em">126MB</td>
+  <td style="font-size:0.85em">update-ca-certificates</td>
+  <td style="font-size:0.85em">—</td>
+</tr>
+<tr id="res-28-detail" style="display:none">
+  <td colspan="10" style="background:#f8f9fb;padding:12px">
+    <p style="margin-top:4px;font-size:0.85em;color:#555">Source: <code>manifests/execs.pp</code>:<code>35</code></p>
+    
+    <p style="margin-top:6px;font-size:0.85em;color:#555">Memory during eval — start: <b>126MB</b> &nbsp; peak: <b>126MB</b> &nbsp; delta: <b style="">+0MB</b></p>
+    <b>Parameters (2):</b>
+    <table style="width:100%;margin-bottom:8px;margin-top:4px">
+      <tr><th>Key</th><th>Value</th></tr><tr><td style="font-weight:bold">command</td><td style="font-family:monospace;font-size:11px">/usr/sbin/update-ca-certificates</td></tr><tr><td style="font-weight:normal">refreshonly</td><td style="font-family:monospace;font-size:11px">False</td></tr>
+    </table>
+    <b>Files written (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td colspan="3">none</td></tr>
+    </table>
+    <b>Files read (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td colspan="3">none</td></tr>
+    </table>
+    <b>Processes (1):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>PID</th><th>Exe</th><th>Args</th><th>Written</th><th>Read</th></tr><tr><td>99990</td><td>/usr/sbin/update-ca-certificates</td><td>update-ca-certificates</td><td>0.0 B</td><td>0.0 B</td></tr>
+    </table>
+    <b>Network (0):</b>
+    <table style="width:100%">
+      <tr><th>Remote</th><th>Direction</th></tr><tr><td colspan="2">none</td></tr>
+    </table>
+    <p style="margin-top:6px;color:#888;font-size:0.85em">strace events in window: 12</p>
+  </td>
+</tr><tr onclick="toggleDetail('res-29')" style="cursor:pointer">
+  <td>Service[docker]</td>
+  <td>Service</td>
+  <td><span style="background:#d4edda;color:#1a6b3a;padding:2px 7px;border-radius:3px;font-size:0.8em;font-weight:bold">changed</span></td>
+  <td>0.670s</td>
+  <td>0.0 B</td>
+  <td>0.0 B</td>
+  <td style="font-size:0.85em;">+0MB</td>
+  <td style="font-size:0.85em">151MB</td>
+  <td style="font-size:0.85em">systemctl</td>
+  <td style="font-size:0.85em">—</td>
+</tr>
+<tr id="res-29-detail" style="display:none">
+  <td colspan="10" style="background:#f8f9fb;padding:12px">
+    <p style="margin-top:4px;font-size:0.85em;color:#555">Source: <code>manifests/services.pp</code>:<code>52</code></p>
+    
+    <p style="margin-top:6px;font-size:0.85em;color:#555">Memory during eval — start: <b>151MB</b> &nbsp; peak: <b>151MB</b> &nbsp; delta: <b style="">+0MB</b></p>
+    <b>Parameters (3):</b>
+    <table style="width:100%;margin-bottom:8px;margin-top:4px">
+      <tr><th>Key</th><th>Value</th></tr><tr><td style="font-weight:bold">ensure</td><td style="font-family:monospace;font-size:11px">running</td></tr><tr><td style="font-weight:bold">require</td><td style="font-family:monospace;font-size:11px">Package[docker-ce]</td></tr><tr><td style="font-weight:normal">enable</td><td style="font-family:monospace;font-size:11px">True</td></tr>
+    </table>
+    <b>Files written (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td colspan="3">none</td></tr>
+    </table>
+    <b>Files read (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td colspan="3">none</td></tr>
+    </table>
+    <b>Processes (1):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>PID</th><th>Exe</th><th>Args</th><th>Written</th><th>Read</th></tr><tr><td>99990</td><td>/usr/bin/systemctl</td><td>systemctl enable --now docker</td><td>0.0 B</td><td>0.0 B</td></tr>
+    </table>
+    <b>Network (0):</b>
+    <table style="width:100%">
+      <tr><th>Remote</th><th>Direction</th></tr><tr><td colspan="2">none</td></tr>
+    </table>
+    <p style="margin-top:6px;color:#888;font-size:0.85em">strace events in window: 10</p>
+  </td>
+</tr><tr onclick="toggleDetail('res-30')" style="cursor:pointer">
+  <td>File[/etc/docker/daemon.json]</td>
+  <td>File</td>
+  <td><span style="background:#d4edda;color:#1a6b3a;padding:2px 7px;border-radius:3px;font-size:0.8em;font-weight:bold">changed</span></td>
+  <td>0.060s</td>
+  <td>512.0 B</td>
+  <td>0.0 B</td>
+  <td style="font-size:0.85em;">+0MB</td>
+  <td style="font-size:0.85em">151MB</td>
+  <td style="font-size:0.85em">—</td>
+  <td style="font-size:0.85em">/etc/docker/daemon.json</td>
+</tr>
+<tr id="res-30-detail" style="display:none">
+  <td colspan="10" style="background:#f8f9fb;padding:12px">
+    <p style="margin-top:4px;font-size:0.85em;color:#555">Source: <code>manifests/files.pp</code>:<code>54</code></p>
+    
+    <p style="margin-top:6px;font-size:0.85em;color:#555">Memory during eval — start: <b>151MB</b> &nbsp; peak: <b>151MB</b> &nbsp; delta: <b style="">+0MB</b></p>
+    <b>Parameters (4):</b>
+    <table style="width:100%;margin-bottom:8px;margin-top:4px">
+      <tr><th>Key</th><th>Value</th></tr><tr><td style="font-weight:bold">content</td><td style="font-family:monospace;font-size:11px">{&quot;log-driver&quot;:&quot;json-file&quot;,&quot;log-opts&quot;:{&quot;max-size&quot;:&quot;100m&quot;}}</td></tr><tr><td style="font-weight:bold">ensure</td><td style="font-family:monospace;font-size:11px">file</td></tr><tr><td style="font-weight:bold">mode</td><td style="font-family:monospace;font-size:11px">0644</td></tr><tr><td style="font-weight:bold">owner</td><td style="font-family:monospace;font-size:11px">root</td></tr>
+    </table>
+    <b>Files written (1):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td>/etc/docker/daemon.json</td><td>512.0 B</td><td>1</td></tr>
+    </table>
+    <b>Files read (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td colspan="3">none</td></tr>
+    </table>
+    <b>Processes (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>PID</th><th>Exe</th><th>Args</th><th>Written</th><th>Read</th></tr><tr><td colspan="5">none</td></tr>
+    </table>
+    <b>Network (0):</b>
+    <table style="width:100%">
+      <tr><th>Remote</th><th>Direction</th></tr><tr><td colspan="2">none</td></tr>
+    </table>
+    <p style="margin-top:6px;color:#888;font-size:0.85em">strace events in window: 2</p>
+  </td>
+</tr><tr onclick="toggleDetail('res-31')" style="cursor:pointer">
+  <td>Package[chrony]</td>
+  <td>Package</td>
+  <td><span style="background:#eee;color:#555;padding:2px 7px;border-radius:3px;font-size:0.8em;font-weight:bold">unchanged</span></td>
+  <td>0.020s</td>
+  <td>0.0 B</td>
+  <td>0.0 B</td>
+  <td style="font-size:0.85em;">+0MB</td>
+  <td style="font-size:0.85em">151MB</td>
+  <td style="font-size:0.85em">—</td>
+  <td style="font-size:0.85em">—</td>
+</tr>
+<tr id="res-31-detail" style="display:none">
+  <td colspan="10" style="background:#f8f9fb;padding:12px">
+    <p style="margin-top:4px;font-size:0.85em;color:#555">Source: <code>manifests/packages.pp</code>:<code>55</code></p>
+    
+    <p style="margin-top:6px;font-size:0.85em;color:#555">Memory during eval — start: <b>151MB</b> &nbsp; peak: <b>151MB</b> &nbsp; delta: <b style="">+0MB</b></p>
+    <b>Parameters (1):</b>
+    <table style="width:100%;margin-bottom:8px;margin-top:4px">
+      <tr><th>Key</th><th>Value</th></tr><tr><td style="font-weight:bold">ensure</td><td style="font-family:monospace;font-size:11px">present</td></tr>
+    </table>
+    <b>Files written (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td colspan="3">none</td></tr>
+    </table>
+    <b>Files read (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td colspan="3">none</td></tr>
+    </table>
+    <b>Processes (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>PID</th><th>Exe</th><th>Args</th><th>Written</th><th>Read</th></tr><tr><td colspan="5">none</td></tr>
+    </table>
+    <b>Network (0):</b>
+    <table style="width:100%">
+      <tr><th>Remote</th><th>Direction</th></tr><tr><td colspan="2">none</td></tr>
+    </table>
+    <p style="margin-top:6px;color:#888;font-size:0.85em">strace events in window: 2</p>
+  </td>
+</tr><tr onclick="toggleDetail('res-32')" style="cursor:pointer">
+  <td>File[/etc/chrony.conf]</td>
+  <td>File</td>
+  <td><span style="background:#d4edda;color:#1a6b3a;padding:2px 7px;border-radius:3px;font-size:0.8em;font-weight:bold">changed</span></td>
+  <td>0.040s</td>
+  <td>1.0 KB</td>
+  <td>0.0 B</td>
+  <td style="font-size:0.85em;">+0MB</td>
+  <td style="font-size:0.85em">151MB</td>
+  <td style="font-size:0.85em">—</td>
+  <td style="font-size:0.85em">/etc/chrony.conf</td>
+</tr>
+<tr id="res-32-detail" style="display:none">
+  <td colspan="10" style="background:#f8f9fb;padding:12px">
+    <p style="margin-top:4px;font-size:0.85em;color:#555">Source: <code>manifests/files.pp</code>:<code>55</code></p>
+    
+    <p style="margin-top:6px;font-size:0.85em;color:#555">Memory during eval — start: <b>151MB</b> &nbsp; peak: <b>151MB</b> &nbsp; delta: <b style="">+0MB</b></p>
+    <b>Parameters (3):</b>
+    <table style="width:100%;margin-bottom:8px;margin-top:4px">
+      <tr><th>Key</th><th>Value</th></tr><tr><td style="font-weight:bold">ensure</td><td style="font-family:monospace;font-size:11px">file</td></tr><tr><td style="font-weight:bold">mode</td><td style="font-family:monospace;font-size:11px">0644</td></tr><tr><td style="font-weight:bold">owner</td><td style="font-family:monospace;font-size:11px">root</td></tr>
+    </table>
+    <b>Files written (1):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td>/etc/chrony.conf</td><td>1.0 KB</td><td>1</td></tr>
+    </table>
+    <b>Files read (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td colspan="3">none</td></tr>
+    </table>
+    <b>Processes (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>PID</th><th>Exe</th><th>Args</th><th>Written</th><th>Read</th></tr><tr><td colspan="5">none</td></tr>
+    </table>
+    <b>Network (0):</b>
+    <table style="width:100%">
+      <tr><th>Remote</th><th>Direction</th></tr><tr><td colspan="2">none</td></tr>
+    </table>
+    <p style="margin-top:6px;color:#888;font-size:0.85em">strace events in window: 2</p>
+  </td>
+</tr><tr onclick="toggleDetail('res-33')" style="cursor:pointer">
+  <td>Service[chronyd]</td>
+  <td>Service</td>
+  <td><span style="background:#eee;color:#555;padding:2px 7px;border-radius:3px;font-size:0.8em;font-weight:bold">unchanged</span></td>
+  <td>0.380s</td>
+  <td>0.0 B</td>
+  <td>0.0 B</td>
+  <td style="font-size:0.85em;">+0MB</td>
+  <td style="font-size:0.85em">151MB</td>
+  <td style="font-size:0.85em">—</td>
+  <td style="font-size:0.85em">—</td>
+</tr>
+<tr id="res-33-detail" style="display:none">
+  <td colspan="10" style="background:#f8f9fb;padding:12px">
+    <p style="margin-top:4px;font-size:0.85em;color:#555">Source: <code>manifests/services.pp</code>:<code>55</code></p>
+    
+    <p style="margin-top:6px;font-size:0.85em;color:#555">Memory during eval — start: <b>151MB</b> &nbsp; peak: <b>151MB</b> &nbsp; delta: <b style="">+0MB</b></p>
+    <b>Parameters (2):</b>
+    <table style="width:100%;margin-bottom:8px;margin-top:4px">
+      <tr><th>Key</th><th>Value</th></tr><tr><td style="font-weight:bold">ensure</td><td style="font-family:monospace;font-size:11px">running</td></tr><tr><td style="font-weight:normal">enable</td><td style="font-family:monospace;font-size:11px">True</td></tr>
+    </table>
+    <b>Files written (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td colspan="3">none</td></tr>
+    </table>
+    <b>Files read (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td colspan="3">none</td></tr>
+    </table>
+    <b>Processes (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>PID</th><th>Exe</th><th>Args</th><th>Written</th><th>Read</th></tr><tr><td colspan="5">none</td></tr>
+    </table>
+    <b>Network (0):</b>
+    <table style="width:100%">
+      <tr><th>Remote</th><th>Direction</th></tr><tr><td colspan="2">none</td></tr>
+    </table>
+    <p style="margin-top:6px;color:#888;font-size:0.85em">strace events in window: 5</p>
+  </td>
+</tr><tr onclick="toggleDetail('res-34')" style="cursor:pointer">
+  <td>Package[apparmor]</td>
+  <td>Package</td>
+  <td><span style="background:#eee;color:#555;padding:2px 7px;border-radius:3px;font-size:0.8em;font-weight:bold">unchanged</span></td>
+  <td>0.020s</td>
+  <td>0.0 B</td>
+  <td>0.0 B</td>
+  <td style="font-size:0.85em;">+0MB</td>
+  <td style="font-size:0.85em">151MB</td>
+  <td style="font-size:0.85em">—</td>
+  <td style="font-size:0.85em">—</td>
+</tr>
+<tr id="res-34-detail" style="display:none">
+  <td colspan="10" style="background:#f8f9fb;padding:12px">
+    <p style="margin-top:4px;font-size:0.85em;color:#555">Source: <code>manifests/packages.pp</code>:<code>56</code></p>
+    
+    <p style="margin-top:6px;font-size:0.85em;color:#555">Memory during eval — start: <b>151MB</b> &nbsp; peak: <b>151MB</b> &nbsp; delta: <b style="">+0MB</b></p>
+    <b>Parameters (1):</b>
+    <table style="width:100%;margin-bottom:8px;margin-top:4px">
+      <tr><th>Key</th><th>Value</th></tr><tr><td style="font-weight:bold">ensure</td><td style="font-family:monospace;font-size:11px">present</td></tr>
+    </table>
+    <b>Files written (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td colspan="3">none</td></tr>
+    </table>
+    <b>Files read (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td colspan="3">none</td></tr>
+    </table>
+    <b>Processes (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>PID</th><th>Exe</th><th>Args</th><th>Written</th><th>Read</th></tr><tr><td colspan="5">none</td></tr>
+    </table>
+    <b>Network (0):</b>
+    <table style="width:100%">
+      <tr><th>Remote</th><th>Direction</th></tr><tr><td colspan="2">none</td></tr>
+    </table>
+    <p style="margin-top:6px;color:#888;font-size:0.85em">strace events in window: 2</p>
+  </td>
+</tr><tr onclick="toggleDetail('res-35')" style="cursor:pointer">
+  <td>Service[apparmor]</td>
+  <td>Service</td>
+  <td><span style="background:#eee;color:#555;padding:2px 7px;border-radius:3px;font-size:0.8em;font-weight:bold">unchanged</span></td>
+  <td>0.220s</td>
+  <td>0.0 B</td>
+  <td>0.0 B</td>
+  <td style="font-size:0.85em;">+0MB</td>
+  <td style="font-size:0.85em">151MB</td>
+  <td style="font-size:0.85em">—</td>
+  <td style="font-size:0.85em">—</td>
+</tr>
+<tr id="res-35-detail" style="display:none">
+  <td colspan="10" style="background:#f8f9fb;padding:12px">
+    <p style="margin-top:4px;font-size:0.85em;color:#555">Source: <code>manifests/services.pp</code>:<code>56</code></p>
+    
+    <p style="margin-top:6px;font-size:0.85em;color:#555">Memory during eval — start: <b>151MB</b> &nbsp; peak: <b>151MB</b> &nbsp; delta: <b style="">+0MB</b></p>
+    <b>Parameters (2):</b>
+    <table style="width:100%;margin-bottom:8px;margin-top:4px">
+      <tr><th>Key</th><th>Value</th></tr><tr><td style="font-weight:bold">ensure</td><td style="font-family:monospace;font-size:11px">running</td></tr><tr><td style="font-weight:normal">enable</td><td style="font-family:monospace;font-size:11px">True</td></tr>
+    </table>
+    <b>Files written (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td colspan="3">none</td></tr>
+    </table>
+    <b>Files read (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td colspan="3">none</td></tr>
+    </table>
+    <b>Processes (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>PID</th><th>Exe</th><th>Args</th><th>Written</th><th>Read</th></tr><tr><td colspan="5">none</td></tr>
+    </table>
+    <b>Network (0):</b>
+    <table style="width:100%">
+      <tr><th>Remote</th><th>Direction</th></tr><tr><td colspan="2">none</td></tr>
+    </table>
+    <p style="margin-top:6px;color:#888;font-size:0.85em">strace events in window: 3</p>
+  </td>
+</tr><tr onclick="toggleDetail('res-36')" style="cursor:pointer">
+  <td>Package[auditd]</td>
+  <td>Package</td>
+  <td><span style="background:#eee;color:#555;padding:2px 7px;border-radius:3px;font-size:0.8em;font-weight:bold">unchanged</span></td>
+  <td>0.020s</td>
+  <td>0.0 B</td>
+  <td>0.0 B</td>
+  <td style="font-size:0.85em;">+0MB</td>
+  <td style="font-size:0.85em">151MB</td>
+  <td style="font-size:0.85em">—</td>
+  <td style="font-size:0.85em">—</td>
+</tr>
+<tr id="res-36-detail" style="display:none">
+  <td colspan="10" style="background:#f8f9fb;padding:12px">
+    <p style="margin-top:4px;font-size:0.85em;color:#555">Source: <code>manifests/packages.pp</code>:<code>57</code></p>
+    
+    <p style="margin-top:6px;font-size:0.85em;color:#555">Memory during eval — start: <b>151MB</b> &nbsp; peak: <b>151MB</b> &nbsp; delta: <b style="">+0MB</b></p>
+    <b>Parameters (1):</b>
+    <table style="width:100%;margin-bottom:8px;margin-top:4px">
+      <tr><th>Key</th><th>Value</th></tr><tr><td style="font-weight:bold">ensure</td><td style="font-family:monospace;font-size:11px">present</td></tr>
+    </table>
+    <b>Files written (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td colspan="3">none</td></tr>
+    </table>
+    <b>Files read (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td colspan="3">none</td></tr>
+    </table>
+    <b>Processes (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>PID</th><th>Exe</th><th>Args</th><th>Written</th><th>Read</th></tr><tr><td colspan="5">none</td></tr>
+    </table>
+    <b>Network (0):</b>
+    <table style="width:100%">
+      <tr><th>Remote</th><th>Direction</th></tr><tr><td colspan="2">none</td></tr>
+    </table>
+    <p style="margin-top:6px;color:#888;font-size:0.85em">strace events in window: 2</p>
+  </td>
+</tr><tr onclick="toggleDetail('res-37')" style="cursor:pointer">
+  <td>File[/etc/audit/audit.rules]</td>
+  <td>File</td>
+  <td><span style="background:#d4edda;color:#1a6b3a;padding:2px 7px;border-radius:3px;font-size:0.8em;font-weight:bold">changed</span></td>
+  <td>0.070s</td>
+  <td>2.0 KB</td>
+  <td>0.0 B</td>
+  <td style="font-size:0.85em;">+0MB</td>
+  <td style="font-size:0.85em">151MB</td>
+  <td style="font-size:0.85em">—</td>
+  <td style="font-size:0.85em">/etc/audit/audit.rules</td>
+</tr>
+<tr id="res-37-detail" style="display:none">
+  <td colspan="10" style="background:#f8f9fb;padding:12px">
+    <p style="margin-top:4px;font-size:0.85em;color:#555">Source: <code>manifests/files.pp</code>:<code>57</code></p>
+    
+    <p style="margin-top:6px;font-size:0.85em;color:#555">Memory during eval — start: <b>151MB</b> &nbsp; peak: <b>151MB</b> &nbsp; delta: <b style="">+0MB</b></p>
+    <b>Parameters (3):</b>
+    <table style="width:100%;margin-bottom:8px;margin-top:4px">
+      <tr><th>Key</th><th>Value</th></tr><tr><td style="font-weight:bold">ensure</td><td style="font-family:monospace;font-size:11px">file</td></tr><tr><td style="font-weight:bold">mode</td><td style="font-family:monospace;font-size:11px">0640</td></tr><tr><td style="font-weight:bold">owner</td><td style="font-family:monospace;font-size:11px">root</td></tr>
+    </table>
+    <b>Files written (1):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td>/etc/audit/audit.rules</td><td>2.0 KB</td><td>1</td></tr>
+    </table>
+    <b>Files read (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td colspan="3">none</td></tr>
+    </table>
+    <b>Processes (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>PID</th><th>Exe</th><th>Args</th><th>Written</th><th>Read</th></tr><tr><td colspan="5">none</td></tr>
+    </table>
+    <b>Network (0):</b>
+    <table style="width:100%">
+      <tr><th>Remote</th><th>Direction</th></tr><tr><td colspan="2">none</td></tr>
+    </table>
+    <p style="margin-top:6px;color:#888;font-size:0.85em">strace events in window: 2</p>
+  </td>
+</tr><tr onclick="toggleDetail('res-38')" style="cursor:pointer">
+  <td>Service[auditd]</td>
+  <td>Service</td>
+  <td><span style="background:#eee;color:#555;padding:2px 7px;border-radius:3px;font-size:0.8em;font-weight:bold">unchanged</span></td>
+  <td>0.310s</td>
+  <td>0.0 B</td>
+  <td>0.0 B</td>
+  <td style="font-size:0.85em;">+0MB</td>
+  <td style="font-size:0.85em">151MB</td>
+  <td style="font-size:0.85em">—</td>
+  <td style="font-size:0.85em">—</td>
+</tr>
+<tr id="res-38-detail" style="display:none">
+  <td colspan="10" style="background:#f8f9fb;padding:12px">
+    <p style="margin-top:4px;font-size:0.85em;color:#555">Source: <code>manifests/services.pp</code>:<code>57</code></p>
+    
+    <p style="margin-top:6px;font-size:0.85em;color:#555">Memory during eval — start: <b>151MB</b> &nbsp; peak: <b>151MB</b> &nbsp; delta: <b style="">+0MB</b></p>
+    <b>Parameters (2):</b>
+    <table style="width:100%;margin-bottom:8px;margin-top:4px">
+      <tr><th>Key</th><th>Value</th></tr><tr><td style="font-weight:bold">ensure</td><td style="font-family:monospace;font-size:11px">running</td></tr><tr><td style="font-weight:normal">enable</td><td style="font-family:monospace;font-size:11px">True</td></tr>
+    </table>
+    <b>Files written (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td colspan="3">none</td></tr>
+    </table>
+    <b>Files read (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td colspan="3">none</td></tr>
+    </table>
+    <b>Processes (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>PID</th><th>Exe</th><th>Args</th><th>Written</th><th>Read</th></tr><tr><td colspan="5">none</td></tr>
+    </table>
+    <b>Network (0):</b>
+    <table style="width:100%">
+      <tr><th>Remote</th><th>Direction</th></tr><tr><td colspan="2">none</td></tr>
+    </table>
+    <p style="margin-top:6px;color:#888;font-size:0.85em">strace events in window: 4</p>
+  </td>
+</tr><tr onclick="toggleDetail('res-39')" style="cursor:pointer">
+  <td>Class[Main]</td>
+  <td>Class</td>
+  <td><span style="background:#eee;color:#555;padding:2px 7px;border-radius:3px;font-size:0.8em;font-weight:bold">unchanged</span></td>
+  <td>0.000s</td>
+  <td>0.0 B</td>
+  <td>0.0 B</td>
+  <td style="font-size:0.85em;">+0MB</td>
+  <td style="font-size:0.85em">151MB</td>
+  <td style="font-size:0.85em">—</td>
+  <td style="font-size:0.85em">—</td>
+</tr>
+<tr id="res-39-detail" style="display:none">
+  <td colspan="10" style="background:#f8f9fb;padding:12px">
+    <p style="margin-top:4px;font-size:0.85em;color:#555">Source: <code>manifests/classs.pp</code>:<code>58</code></p>
+    
+    <p style="margin-top:6px;font-size:0.85em;color:#555">Memory during eval — start: <b>151MB</b> &nbsp; peak: <b>151MB</b> &nbsp; delta: <b style="">+0MB</b></p>
+    <b>Parameters (0):</b>
+    <table style="width:100%;margin-bottom:8px;margin-top:4px">
+      <tr><th>Key</th><th>Value</th></tr><tr><td colspan="2" style="color:#888">none (PuppetDB not queried or resource has no params)</td></tr>
+    </table>
+    <b>Files written (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td colspan="3">none</td></tr>
+    </table>
+    <b>Files read (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>Path</th><th>Bytes</th><th>Ops</th></tr><tr><td colspan="3">none</td></tr>
+    </table>
+    <b>Processes (0):</b>
+    <table style="width:100%;margin-bottom:8px">
+      <tr><th>PID</th><th>Exe</th><th>Args</th><th>Written</th><th>Read</th></tr><tr><td colspan="5">none</td></tr>
+    </table>
+    <b>Network (0):</b>
+    <table style="width:100%">
+      <tr><th>Remote</th><th>Direction</th></tr><tr><td colspan="2">none</td></tr>
+    </table>
+    <p style="margin-top:6px;color:#888;font-size:0.85em">strace events in window: 2</p>
+  </td>
+</tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="timeline">
+  <h2>Resource I/O Timeline</h2>
+  <svg xmlns="http://www.w3.org/2000/svg" width="1000" height="896" style="background:#fff;border:1px solid #e0e0e0;border-radius:4px;display:block">
+<text x="600" y="16" text-anchor="middle" font-family="monospace" font-size="12" font-weight="bold">Resource I/O Timeline</text>
+<text x="600" y="30" text-anchor="middle" font-family="monospace" font-size="10" fill="#666">color = total disk I/O (gray=none, blue=small, red=large)</text>
+<line x1="220" y1="36" x2="220" y2="836" stroke="#bbb" stroke-width="1"/>
+<line x1="220" y1="836" x2="980" y2="836" stroke="#bbb" stroke-width="1"/>
+<line x1="220.0" y1="836" x2="220.0" y2="840" stroke="#888"/>
+<text x="220.0" y="850" text-anchor="middle" font-family="monospace" font-size="10">0s</text>
+<line x1="410.0" y1="836" x2="410.0" y2="840" stroke="#888"/>
+<text x="410.0" y="850" text-anchor="middle" font-family="monospace" font-size="10">5s</text>
+<line x1="600.0" y1="836" x2="600.0" y2="840" stroke="#888"/>
+<text x="600.0" y="850" text-anchor="middle" font-family="monospace" font-size="10">10s</text>
+<line x1="790.0" y1="836" x2="790.0" y2="840" stroke="#888"/>
+<text x="790.0" y="850" text-anchor="middle" font-family="monospace" font-size="10">14s</text>
+<line x1="980.0" y1="836" x2="980.0" y2="840" stroke="#888"/>
+<text x="980.0" y="850" text-anchor="middle" font-family="monospace" font-size="10">19s</text>
+<text x="216" y="50" text-anchor="end" font-family="monospace" font-size="9" fill="#333">File[/etc/ssh/sshd_config]</text>
+<rect x="220.0" y="38" width="4.7" height="16" fill="#aaa" rx="2" opacity="0.85"><title>File[/etc/ssh/sshd_config] | dur:0.120s | written:0.0 B | read:0.0 B | strace:2</title></rect>
+<text x="216" y="70" text-anchor="end" font-family="monospace" font-size="9" fill="#333">File[/etc/motd]</text>
+<rect x="225.5" y="58" width="2.0" height="16" fill="rgb(165,161,89)" rx="2" opacity="0.85"><title>File[/etc/motd] | dur:0.030s | written:512.0 KB | read:0.0 B | strace:2</title></rect>
+<text x="216" y="90" text-anchor="end" font-family="monospace" font-size="9" fill="#333">Service[sshd]</text>
+<rect x="227.1" y="78" width="37.6" height="16" fill="#aaa" rx="2" opacity="0.85"><title>Service[sshd] | dur:0.950s | written:0.0 B | read:0.0 B | strace:14</title></rect>
+<text x="216" y="110" text-anchor="end" font-family="monospace" font-size="9" fill="#333">Package[nginx]</text>
+<rect x="267.5" y="98" width="92.5" height="16" fill="rgb(255,16,0)" rx="2" opacity="0.85"><title>Package[nginx] | dur:2.340s | written:50.0 MB | read:10.0 MB | strace:35</title></rect>
+<text x="216" y="130" text-anchor="end" font-family="monospace" font-size="9" fill="#333">Package[curl]</text>
+<rect x="360.4" y="118" width="2.0" height="16" fill="#aaa" rx="2" opacity="0.85"><title>Package[curl] | dur:0.020s | written:0.0 B | read:0.0 B | strace:2</title></rect>
+<text x="216" y="150" text-anchor="end" font-family="monospace" font-size="9" fill="#333">Package[wget]</text>
+<rect x="361.6" y="138" width="2.0" height="16" fill="#aaa" rx="2" opacity="0.85"><title>Package[wget] | dur:0.020s | written:0.0 B | read:0.0 B | strace:2</title></rect>
+<text x="216" y="170" text-anchor="end" font-family="monospace" font-size="9" fill="#333">Package[git]</text>
+<rect x="362.7" y="158" width="2.0" height="16" fill="#aaa" rx="2" opacity="0.85"><title>Package[git] | dur:0.020s | written:0.0 B | read:0.0 B | strace:2</title></rect>
+<text x="216" y="190" text-anchor="end" font-family="monospace" font-size="9" fill="#333">Package[vim]</text>
+<rect x="363.9" y="178" width="73.9" height="16" fill="rgb(255,16,0)" rx="2" opacity="0.85"><title>Package[vim] | dur:1.870s | written:50.0 MB | read:10.0 MB | strace:28</title></rect>
+<text x="216" y="210" text-anchor="end" font-family="monospace" font-size="9" fill="#333">Service[nginx]</text>
+<rect x="438.3" y="198" width="17.8" height="16" fill="#aaa" rx="2" opacity="0.85"><title>Service[nginx] | dur:0.450s | written:0.0 B | read:0.0 B | strace:6</title></rect>
+<text x="216" y="230" text-anchor="end" font-family="monospace" font-size="9" fill="#333">File[/etc/nginx/nginx.conf]</text>
+<rect x="456.5" y="218" width="3.2" height="16" fill="rgb(255,105,0)" rx="2" opacity="0.85"><title>File[/etc/nginx/nginx.conf] | dur:0.080s | written:5.0 MB | read:4.0 KB | strace:2</title></rect>
+<text x="216" y="250" text-anchor="end" font-family="monospace" font-size="9" fill="#333">File[/etc/nginx/sites-enabled/</text>
+<rect x="460.0" y="238" width="2.0" height="16" fill="#aaa" rx="2" opacity="0.85"><title>File[/etc/nginx/sites-enabled/default] | dur:0.050s | written:0.0 B | read:0.0 B | strace:2</title></rect>
+<text x="216" y="270" text-anchor="end" font-family="monospace" font-size="9" fill="#333">User[deploy]</text>
+<rect x="462.4" y="258" width="5.5" height="16" fill="#aaa" rx="2" opacity="0.85"><title>User[deploy] | dur:0.140s | written:0.0 B | read:0.0 B | strace:2</title></rect>
+<text x="216" y="290" text-anchor="end" font-family="monospace" font-size="9" fill="#333">Group[deploy]</text>
+<rect x="468.3" y="278" width="3.2" height="16" fill="#aaa" rx="2" opacity="0.85"><title>Group[deploy] | dur:0.080s | written:0.0 B | read:0.0 B | strace:2</title></rect>
+<text x="216" y="310" text-anchor="end" font-family="monospace" font-size="9" fill="#333">File[/etc/security/limits.conf</text>
+<rect x="471.9" y="298" width="2.0" height="16" fill="#aaa" rx="2" opacity="0.85"><title>File[/etc/security/limits.conf] | dur:0.040s | written:0.0 B | read:0.0 B | strace:2</title></rect>
+<text x="216" y="330" text-anchor="end" font-family="monospace" font-size="9" fill="#333">Exec[sysctl -p]</text>
+<rect x="473.9" y="318" width="8.7" height="16" fill="#aaa" rx="2" opacity="0.85"><title>Exec[sysctl -p] | dur:0.220s | written:0.0 B | read:0.0 B | strace:3</title></rect>
+<text x="216" y="350" text-anchor="end" font-family="monospace" font-size="9" fill="#333">File[/etc/sysctl.d/99-custom.c</text>
+<rect x="483.0" y="338" width="2.0" height="16" fill="rgb(165,161,89)" rx="2" opacity="0.85"><title>File[/etc/sysctl.d/99-custom.conf] | dur:0.030s | written:512.0 KB | read:0.0 B | strace:2</title></rect>
+<text x="216" y="370" text-anchor="end" font-family="monospace" font-size="9" fill="#333">Package[prometheus-node-export</text>
+<rect x="484.5" y="358" width="126.9" height="16" fill="rgb(255,44,0)" rx="2" opacity="0.85"><title>Package[prometheus-node-exporter] | dur:3.210s | written:0.0 B | read:27.3 MB | strace:48</title></rect>
+<text x="216" y="390" text-anchor="end" font-family="monospace" font-size="9" fill="#333">Service[prometheus-node-export</text>
+<rect x="611.9" y="378" width="21.7" height="16" fill="#aaa" rx="2" opacity="0.85"><title>Service[prometheus-node-exporter] | dur:0.550s | written:0.0 B | read:0.0 B | strace:8</title></rect>
+<text x="216" y="410" text-anchor="end" font-family="monospace" font-size="9" fill="#333">File[/etc/default/prometheus-n</text>
+<rect x="634.0" y="398" width="2.0" height="16" fill="#aaa" rx="2" opacity="0.85"><title>File[/etc/default/prometheus-node-exporter] | dur:0.040s | written:0.0 B | read:0.0 B | strace:2</title></rect>
+<text x="216" y="430" text-anchor="end" font-family="monospace" font-size="9" fill="#333">Package[rsyslog]</text>
+<rect x="636.0" y="418" width="2.0" height="16" fill="#aaa" rx="2" opacity="0.85"><title>Package[rsyslog] | dur:0.020s | written:0.0 B | read:0.0 B | strace:2</title></rect>
+<text x="216" y="450" text-anchor="end" font-family="monospace" font-size="9" fill="#333">File[/etc/rsyslog.conf]</text>
+<rect x="637.2" y="438" width="2.4" height="16" fill="rgb(255,105,0)" rx="2" opacity="0.85"><title>File[/etc/rsyslog.conf] | dur:0.060s | written:5.0 MB | read:0.0 B | strace:2</title></rect>
+<text x="216" y="470" text-anchor="end" font-family="monospace" font-size="9" fill="#333">Service[rsyslog]</text>
+<rect x="639.9" y="458" width="16.2" height="16" fill="#aaa" rx="2" opacity="0.85"><title>Service[rsyslog] | dur:0.410s | written:0.0 B | read:0.0 B | strace:6</title></rect>
+<text x="216" y="490" text-anchor="end" font-family="monospace" font-size="9" fill="#333">Cron[backup-daily]</text>
+<rect x="656.5" y="478" width="2.8" height="16" fill="#aaa" rx="2" opacity="0.85"><title>Cron[backup-daily] | dur:0.070s | written:0.0 B | read:0.0 B | strace:2</title></rect>
+<text x="216" y="510" text-anchor="end" font-family="monospace" font-size="9" fill="#333">Exec[iptables-restore]</text>
+<rect x="659.7" y="498" width="7.1" height="16" fill="#aaa" rx="2" opacity="0.85"><title>Exec[iptables-restore] | dur:0.180s | written:0.0 B | read:0.0 B | strace:2</title></rect>
+<text x="216" y="530" text-anchor="end" font-family="monospace" font-size="9" fill="#333">File[/etc/iptables/rules.v4]</text>
+<rect x="667.2" y="518" width="3.6" height="16" fill="rgb(60,154,224)" rx="2" opacity="0.85"><title>File[/etc/iptables/rules.v4] | dur:0.090s | written:2.0 KB | read:0.0 B | strace:2</title></rect>
+<text x="216" y="550" text-anchor="end" font-family="monospace" font-size="9" fill="#333">File[/etc/ssl/certs/example.cr</text>
+<rect x="671.2" y="538" width="4.3" height="16" fill="#aaa" rx="2" opacity="0.85"><title>File[/etc/ssl/certs/example.crt] | dur:0.110s | written:0.0 B | read:0.0 B | strace:2</title></rect>
+<text x="216" y="570" text-anchor="end" font-family="monospace" font-size="9" fill="#333">File[/etc/ssl/private/example.</text>
+<rect x="675.9" y="558" width="2.0" height="16" fill="#aaa" rx="2" opacity="0.85"><title>File[/etc/ssl/private/example.key] | dur:0.050s | written:0.0 B | read:0.0 B | strace:2</title></rect>
+<text x="216" y="590" text-anchor="end" font-family="monospace" font-size="9" fill="#333">Exec[update-ca-certificates]</text>
+<rect x="678.3" y="578" width="33.2" height="16" fill="#aaa" rx="2" opacity="0.85"><title>Exec[update-ca-certificates] | dur:0.840s | written:0.0 B | read:0.0 B | strace:12</title></rect>
+<text x="216" y="610" text-anchor="end" font-family="monospace" font-size="9" fill="#333">Package[docker-ce]</text>
+<rect x="711.9" y="598" width="192.6" height="16" fill="rgb(255,0,0)" rx="2" opacity="0.85"><title>Package[docker-ce] | dur:4.870s | written:200.0 MB | read:97.7 MB | strace:73</title></rect>
+<text x="216" y="630" text-anchor="end" font-family="monospace" font-size="9" fill="#333">Service[docker]</text>
+<rect x="904.9" y="618" width="26.5" height="16" fill="#aaa" rx="2" opacity="0.85"><title>Service[docker] | dur:0.670s | written:0.0 B | read:0.0 B | strace:10</title></rect>
+<text x="216" y="650" text-anchor="end" font-family="monospace" font-size="9" fill="#333">File[/etc/docker/daemon.json]</text>
+<rect x="931.4" y="638" width="2.4" height="16" fill="rgb(74,144,217)" rx="2" opacity="0.85"><title>File[/etc/docker/daemon.json] | dur:0.060s | written:512.0 B | read:0.0 B | strace:2</title></rect>
+<text x="216" y="670" text-anchor="end" font-family="monospace" font-size="9" fill="#333">Package[chrony]</text>
+<rect x="934.1" y="658" width="2.0" height="16" fill="#aaa" rx="2" opacity="0.85"><title>Package[chrony] | dur:0.020s | written:0.0 B | read:0.0 B | strace:2</title></rect>
+<text x="216" y="690" text-anchor="end" font-family="monospace" font-size="9" fill="#333">File[/etc/chrony.conf]</text>
+<rect x="935.3" y="678" width="2.0" height="16" fill="rgb(73,144,217)" rx="2" opacity="0.85"><title>File[/etc/chrony.conf] | dur:0.040s | written:1.0 KB | read:0.0 B | strace:2</title></rect>
+<text x="216" y="710" text-anchor="end" font-family="monospace" font-size="9" fill="#333">Service[chronyd]</text>
+<rect x="937.3" y="698" width="15.0" height="16" fill="#aaa" rx="2" opacity="0.85"><title>Service[chronyd] | dur:0.380s | written:0.0 B | read:0.0 B | strace:5</title></rect>
+<text x="216" y="730" text-anchor="end" font-family="monospace" font-size="9" fill="#333">Package[apparmor]</text>
+<rect x="952.7" y="718" width="2.0" height="16" fill="#aaa" rx="2" opacity="0.85"><title>Package[apparmor] | dur:0.020s | written:0.0 B | read:0.0 B | strace:2</title></rect>
+<text x="216" y="750" text-anchor="end" font-family="monospace" font-size="9" fill="#333">Service[apparmor]</text>
+<rect x="953.9" y="738" width="8.7" height="16" fill="#aaa" rx="2" opacity="0.85"><title>Service[apparmor] | dur:0.220s | written:0.0 B | read:0.0 B | strace:3</title></rect>
+<text x="216" y="770" text-anchor="end" font-family="monospace" font-size="9" fill="#333">Package[auditd]</text>
+<rect x="963.0" y="758" width="2.0" height="16" fill="#aaa" rx="2" opacity="0.85"><title>Package[auditd] | dur:0.020s | written:0.0 B | read:0.0 B | strace:2</title></rect>
+<text x="216" y="790" text-anchor="end" font-family="monospace" font-size="9" fill="#333">File[/etc/audit/audit.rules]</text>
+<rect x="964.2" y="778" width="2.8" height="16" fill="rgb(60,154,224)" rx="2" opacity="0.85"><title>File[/etc/audit/audit.rules] | dur:0.070s | written:2.0 KB | read:0.0 B | strace:2</title></rect>
+<text x="216" y="810" text-anchor="end" font-family="monospace" font-size="9" fill="#333">Service[auditd]</text>
+<rect x="967.3" y="798" width="12.3" height="16" fill="#aaa" rx="2" opacity="0.85"><title>Service[auditd] | dur:0.310s | written:0.0 B | read:0.0 B | strace:4</title></rect>
+<text x="216" y="830" text-anchor="end" font-family="monospace" font-size="9" fill="#333">Class[Main]</text>
+<rect x="980.0" y="818" width="2.0" height="16" fill="#aaa" rx="2" opacity="0.85"><title>Class[Main] | dur:0.000s | written:0.0 B | read:0.0 B | strace:2</title></rect>
+<text x="220" y="852" font-family="monospace" font-size="10" fill="#555">I/O scale:</text>
+<rect x="278" y="846" width="14" height="10" fill="#aaa" rx="2"/>
+<text x="296" y="856" font-family="monospace" font-size="10" fill="#333">none</text>
+<rect x="336" y="846" width="14" height="10" fill="rgb(74,144,217)" rx="2"/>
+<text x="354" y="856" font-family="monospace" font-size="10" fill="#333">small (&lt;1MB)</text>
+<rect x="450" y="846" width="14" height="10" fill="rgb(255,140,0)" rx="2"/>
+<text x="468" y="856" font-family="monospace" font-size="10" fill="#333">medium (~10MB)</text>
+<rect x="578" y="846" width="14" height="10" fill="rgb(255,0,0)" rx="2"/>
+<text x="596" y="856" font-family="monospace" font-size="10" fill="#333">large (&gt;100MB)</text>
+</svg>
+</section>
+
+<section id="idempotency">
+  <h2>Idempotency</h2>
+  <p><span class="idem-pass">PASS</span>
+  </p>
+  <details>
+    <summary>Expand --noop run output</summary>
+    <pre>(not run)</pre>
+  </details>
+</section>
+
+<section id="sysctx">
+  <h2>System Context</h2>
+  <details>
+    <summary>Pre-run: /proc/meminfo + df</summary>
+    <pre>(not captured)</pre>
+  </details>
+  <details>
+    <summary>Post-run: /proc/meminfo + df + ss</summary>
+    <pre>(not captured)</pre>
+  </details>
+</section>
+
+<section id="logs">
+  <h2>Raw Logs</h2>
+  <details open>
+    <summary>Puppet stdout/stderr</summary>
+    <pre>Info: Using configured environment &#x27;production&#x27;
+Info: Loading facts
+Notice: Compiled catalog for puppet-agent.example.com in environment production in 4.12 seconds
+Info: Applying configuration version &#x27;1716490000&#x27;
+Info: /Stage[main]/Base::Ssh/File[/etc/ssh/sshd_config]: Starting to evaluate the resource (1 of 40)
+Info: /Stage[main]/Base::Ssh/File[/etc/ssh/sshd_config]: Evaluated in 0.12 seconds
+Notice: /Stage[main]/Base::Ssh/File[/etc/ssh/sshd_config]/content: content changed &#x27;{md5}aabbcc&#x27; to &#x27;{md5}112233&#x27;
+Info: /Stage[main]/Base::Motd/File[/etc/motd]: Starting to evaluate the resource (2 of 40)
+Info: /Stage[main]/Base::Motd/File[/etc/motd]: Evaluated in 0.03 seconds
+Notice: /Stage[main]/Base::Motd/File[/etc/motd]/content: content changed &#x27;{md5}abc&#x27; to &#x27;{md5}def&#x27;
+Info: /Stage[main]/Base::Ssh/Service[sshd]: Starting to evaluate the resource (3 of 40)
+Info: /Stage[main]/Base::Ssh/Service[sshd]: Evaluated in 0.95 seconds
+Notice: /Stage[main]/Base::Ssh/Service[sshd]: Triggered &#x27;refresh&#x27; from 1 event
+Info: /Stage[main]/Packages/Package[nginx]: Starting to evaluate the resource (4 of 40)
+Info: /Stage[main]/Packages/Package[nginx]: Evaluated in 2.34 seconds
+Notice: /Stage[main]/Packages/Package[nginx]/ensure: created
+Info: /Stage[main]/Packages/Package[curl]: Starting to evaluate the resource (5 of 40)
+Info: /Stage[main]/Packages/Package[curl]: Evaluated in 0.02 seconds
+Info: /Stage[main]/Packages/Package[wget]: Starting to evaluate the resource (6 of 40)
+Info: /Stage[main]/Packages/Package[wget]: Evaluated in 0.02 seconds
+Info: /Stage[main]/Packages/Package[git]: Starting to evaluate the resource (7 of 40)
+Info: /Stage[main]/Packages/Package[git]: Evaluated in 0.02 seconds
+Info: /Stage[main]/Packages/Package[vim]: Starting to evaluate the resource (8 of 40)
+Info: /Stage[main]/Packages/Package[vim]: Evaluated in 1.87 seconds
+Notice: /Stage[main]/Packages/Package[vim]/ensure: created
+Info: /Stage[main]/Web::Nginx/Service[nginx]: Starting to evaluate the resource (9 of 40)
+Info: /Stage[main]/Web::Nginx/Service[nginx]: Evaluated in 0.45 seconds
+Notice: /Stage[main]/Web::Nginx/Service[nginx]: Triggered &#x27;refresh&#x27; from 1 event
+Info: /Stage[main]/Web::Nginx/File[/etc/nginx/nginx.conf]: Starting to evaluate the resource (10 of 40)
+Info: /Stage[main]/Web::Nginx/File[/etc/nginx/nginx.conf]: Evaluated in 0.08 seconds
+Notice: /Stage[main]/Web::Nginx/File[/etc/nginx/nginx.conf]/content: content changed &#x27;{md5}old&#x27; to &#x27;{md5}new&#x27;
+Info: /Stage[main]/Web::Nginx/File[/etc/nginx/sites-enabled/default]: Starting to evaluate the resource (11 of 40)
+Info: /Stage[main]/Web::Nginx/File[/etc/nginx/sites-enabled/default]: Evaluated in 0.05 seconds
+Info: /Stage[main]/Users/User[deploy]: Starting to evaluate the resource (12 of 40)
+Info: /Stage[main]/Users/User[deploy]: Evaluated in 0.14 seconds
+Notice: /Stage[main]/Users/User[deploy]/ensure: created
+Info: /Stage[main]/Users/Group[deploy]: Starting to evaluate the resource (13 of 40)
+Info: /Stage[main]/Users/Group[deploy]: Evaluated in 0.08 seconds
+Info: /Stage[main]/Base::Limits/File[/etc/security/limits.conf]: Starting to evaluate the resource (14 of 40)
+Info: /Stage[main]/Base::Limits/File[/etc/security/limits.conf]: Evaluated in 0.04 seconds
+Info: /Stage[main]/Base::Sysctl/Exec[sysctl -p]: Starting to evaluate the resource (15 of 40)
+Info: /Stage[main]/Base::Sysctl/Exec[sysctl -p]: Evaluated in 0.22 seconds
+Notice: /Stage[main]/Base::Sysctl/Exec[sysctl -p]: executed successfully
+Info: /Stage[main]/Base::Sysctl/File[/etc/sysctl.d/99-custom.conf]: Starting to evaluate the resource (16 of 40)
+Info: /Stage[main]/Base::Sysctl/File[/etc/sysctl.d/99-custom.conf]: Evaluated in 0.03 seconds
+Notice: /Stage[main]/Base::Sysctl/File[/etc/sysctl.d/99-custom.conf]/content: content changed &#x27;{md5}x&#x27; to &#x27;{md5}y&#x27;
+Info: /Stage[main]/Monitoring/Package[prometheus-node-exporter]: Starting to evaluate the resource (17 of 40)
+Info: /Stage[main]/Monitoring/Package[prometheus-node-exporter]: Evaluated in 3.21 seconds
+Notice: /Stage[main]/Monitoring/Package[prometheus-node-exporter]/ensure: created
+Info: /Stage[main]/Monitoring/Service[prometheus-node-exporter]: Starting to evaluate the resource (18 of 40)
+Info: /Stage[main]/Monitoring/Service[prometheus-node-exporter]: Evaluated in 0.55 seconds
+Info: /Stage[main]/Monitoring/File[/etc/default/prometheus-node-exporter]: Starting to evaluate the resource (19 of 40)
+Info: /Stage[main]/Monitoring/File[/etc/default/prometheus-node-exporter]: Evaluated in 0.04 seconds
+Info: /Stage[main]/Logging/Package[rsyslog]: Starting to evaluate the resource (20 of 40)
+Info: /Stage[main]/Logging/Package[rsyslog]: Evaluated in 0.02 seconds
+Info: /Stage[main]/Logging/File[/etc/rsyslog.conf]: Starting to evaluate the resource (21 of 40)
+Info: /Stage[main]/Logging/File[/etc/rsyslog.conf]: Evaluated in 0.06 seconds
+Notice: /Stage[main]/Logging/File[/etc/rsyslog.conf]/content: content changed &#x27;{md5}old&#x27; to &#x27;{md5}new&#x27;
+Info: /Stage[main]/Logging/Service[rsyslog]: Starting to evaluate the resource (22 of 40)
+Info: /Stage[main]/Logging/Service[rsyslog]: Evaluated in 0.41 seconds
+Info: /Stage[main]/Cron/Cron[backup-daily]: Starting to evaluate the resource (23 of 40)
+Info: /Stage[main]/Cron/Cron[backup-daily]: Evaluated in 0.07 seconds
+Notice: /Stage[main]/Cron/Cron[backup-daily]/ensure: created
+Info: /Stage[main]/Firewall/Exec[iptables-restore]: Starting to evaluate the resource (24 of 40)
+Info: /Stage[main]/Firewall/Exec[iptables-restore]: Evaluated in 0.18 seconds
+Info: /Stage[main]/Firewall/File[/etc/iptables/rules.v4]: Starting to evaluate the resource (25 of 40)
+Info: /Stage[main]/Firewall/File[/etc/iptables/rules.v4]: Evaluated in 0.09 seconds
+Notice: /Stage[main]/Firewall/File[/etc/iptables/rules.v4]/content: content changed &#x27;{md5}old&#x27; to &#x27;{md5}new&#x27;
+Info: /Stage[main]/Tls/File[/etc/ssl/certs/example.crt]: Starting to evaluate the resource (26 of 40)
+Info: /Stage[main]/Tls/File[/etc/ssl/certs/example.crt]: Evaluated in 0.11 seconds
+Info: /Stage[main]/Tls/File[/etc/ssl/private/example.key]: Starting to evaluate the resource (27 of 40)
+Info: /Stage[main]/Tls/File[/etc/ssl/private/example.key]: Evaluated in 0.05 seconds
+Info: /Stage[main]/Tls/Exec[update-ca-certificates]: Starting to evaluate the resource (28 of 40)
+Info: /Stage[main]/Tls/Exec[update-ca-certificates]: Evaluated in 0.84 seconds
+Notice: /Stage[main]/Tls/Exec[update-ca-certificates]: executed successfully
+Info: /Stage[main]/Docker/Package[docker-ce]: Starting to evaluate the resource (29 of 40)
+Info: /Stage[main]/Docker/Package[docker-ce]: Evaluated in 4.87 seconds
+Notice: /Stage[main]/Docker/Package[docker-ce]/ensure: created
+Info: /Stage[main]/Docker/Service[docker]: Starting to evaluate the resource (30 of 40)
+Info: /Stage[main]/Docker/Service[docker]: Evaluated in 0.67 seconds
+Notice: /Stage[main]/Docker/Service[docker]: Triggered &#x27;refresh&#x27; from 1 event
+Info: /Stage[main]/Docker/File[/etc/docker/daemon.json]: Starting to evaluate the resource (31 of 40)
+Info: /Stage[main]/Docker/File[/etc/docker/daemon.json]: Evaluated in 0.06 seconds
+Notice: /Stage[main]/Docker/File[/etc/docker/daemon.json]/content: content changed &#x27;{md5}old&#x27; to &#x27;{md5}new&#x27;
+Info: /Stage[main]/Base::Ntp/Package[chrony]: Starting to evaluate the resource (32 of 40)
+Info: /Stage[main]/Base::Ntp/Package[chrony]: Evaluated in 0.02 seconds
+Info: /Stage[main]/Base::Ntp/File[/etc/chrony.conf]: Starting to evaluate the resource (33 of 40)
+Info: /Stage[main]/Base::Ntp/File[/etc/chrony.conf]: Evaluated in 0.04 seconds
+Notice: /Stage[main]/Base::Ntp/File[/etc/chrony.conf]/content: content changed &#x27;{md5}old&#x27; to &#x27;{md5}new&#x27;
+Info: /Stage[main]/Base::Ntp/Service[chronyd]: Starting to evaluate the resource (34 of 40)
+Info: /Stage[main]/Base::Ntp/Service[chronyd]: Evaluated in 0.38 seconds
+Info: /Stage[main]/Apparmor/Package[apparmor]: Starting to evaluate the resource (35 of 40)
+Info: /Stage[main]/Apparmor/Package[apparmor]: Evaluated in 0.02 seconds
+Info: /Stage[main]/Apparmor/Service[apparmor]: Starting to evaluate the resource (36 of 40)
+Info: /Stage[main]/Apparmor/Service[apparmor]: Evaluated in 0.22 seconds
+Info: /Stage[main]/Audit/Package[auditd]: Starting to evaluate the resource (37 of 40)
+Info: /Stage[main]/Audit/Package[auditd]: Evaluated in 0.02 seconds
+Info: /Stage[main]/Audit/File[/etc/audit/audit.rules]: Starting to evaluate the resource (38 of 40)
+Info: /Stage[main]/Audit/File[/etc/audit/audit.rules]: Evaluated in 0.07 seconds
+Notice: /Stage[main]/Audit/File[/etc/audit/audit.rules]/content: content changed &#x27;{md5}old&#x27; to &#x27;{md5}new&#x27;
+Info: /Stage[main]/Audit/Service[auditd]: Starting to evaluate the resource (39 of 40)
+Info: /Stage[main]/Audit/Service[auditd]: Evaluated in 0.31 seconds
+Info: Class[Main]: Starting to evaluate the resource (40 of 40)
+Info: Class[Main]: Evaluated in 0.00 seconds
+Notice: Applied catalog in 18.74 seconds
+</pre>
+  </details>
+  <details><summary>Top 20 files by strace ops</summary><pre>     1  /etc/puppet/puppet.conf
+     1  /etc/ssh/sshd_config.puppet_tmp
+     1  # managed by puppet\n
+     1  /etc/motd.puppet_tmp
+     1  Welcome\n
+     1  [&quot;systemctl&quot;,
+     1  /var/cache/apt/pkgcache.bin</pre></details>
+</section>
+
+</main>
+</body>
+</html>
