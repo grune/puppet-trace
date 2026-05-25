@@ -15,6 +15,7 @@
 #           puppet-profile-parser.rb, ruby
 
 set -euo pipefail
+trap '' PIPE
 
 # Initialize late-dispatch variables early so environment injection is overwritten
 _LATE_SUBCMD=""
@@ -44,6 +45,43 @@ _validate_safe_path() {
         echo "[puppet-trace] ERROR: $name contains path traversal: '$val'" >&2
         return 1
     fi
+}
+
+# Validate an SSH private-key path supplied via PUPPET_TRACE_SSH_KEY.
+# Returns 0 if safe; prints a warning and returns 1 if not.
+# Callers should fall back to the default key on failure.
+_validate_ssh_key_path() {
+    local key_path="$1" default_key="$2"
+    # Reuse safe-path checks (no quotes, no $(), no traversal)
+    if ! _validate_safe_path "$key_path" "PUPPET_TRACE_SSH_KEY"; then
+        echo "[puppet-trace] WARNING: PUPPET_TRACE_SSH_KEY rejected — falling back to $default_key" >&2
+        return 1
+    fi
+    # Must exist as a regular file
+    if [[ ! -f "$key_path" ]]; then
+        echo "[puppet-trace] WARNING: PUPPET_TRACE_SSH_KEY '$key_path' not found — falling back to $default_key" >&2
+        return 1
+    fi
+    # Reject world-writable files (mode ends in 7, 6, 5, 4, 3, 2 for other-write bit)
+    local _mode
+    _mode=$(stat -c '%a' "$key_path" 2>/dev/null) || {
+        echo "[puppet-trace] WARNING: cannot stat PUPPET_TRACE_SSH_KEY '$key_path' — falling back to $default_key" >&2
+        return 1
+    }
+    # World-writable = other-write bit set (octal last digit & 2)
+    local _other=$(( _mode % 10 ))
+    if (( (_other & 2) != 0 )); then
+        echo "[puppet-trace] WARNING: PUPPET_TRACE_SSH_KEY '$key_path' is world-writable (mode $_mode) — falling back to $default_key" >&2
+        return 1
+    fi
+    # Also reject if owned by someone other than root or current user
+    local _owner_uid
+    _owner_uid=$(stat -c '%u' "$key_path" 2>/dev/null) || return 0
+    if [[ "$_owner_uid" != "0" ]] && [[ "$_owner_uid" != "$(id -u)" ]]; then
+        echo "[puppet-trace] WARNING: PUPPET_TRACE_SSH_KEY '$key_path' owned by uid $_owner_uid (not root or current user) — falling back to $default_key" >&2
+        return 1
+    fi
+    return 0
 }
 
 # Cleanup trap — kill background processes on exit/interrupt
@@ -84,6 +122,7 @@ cmd_enable() {
         exit 1
     fi
 
+    mkdir -m 0755 -p /var/log/puppet-trace
     touch "$FLAG_FILE"
     echo "[puppet-trace] flag file: $FLAG_FILE created"
 
@@ -125,6 +164,7 @@ cmd_disable() {
         exit 1
     fi
 
+    mkdir -m 0755 -p /var/log/puppet-trace
     rm -f "$FLAG_FILE"
     echo "[puppet-trace] flag file removed"
 
@@ -194,7 +234,7 @@ cmd_collect() {
     local TIMESTAMP
     TIMESTAMP=$(date +%Y%m%d-%H%M%S)
     local OUTDIR="/var/log/puppet-trace/${TIMESTAMP}"
-    mkdir -m 0700 -p "$OUTDIR"
+    mkdir -m 0755 -p "$OUTDIR"
 
     local PUPPET_LOG="$OUTDIR/puppet.log"
     local PROFILE_LOG="$OUTDIR/puppetserver-profile.log"
@@ -235,12 +275,24 @@ cmd_collect() {
     [[ -z "$puppet_server" ]] && { echo "[puppet-trace] ERROR: could not determine puppet server" >&2; return 1; }
 
     local _ssh_user="${PUPPET_TRACE_SSH_USER:-puppet}"
-    local _ssh_key="${PUPPET_TRACE_SSH_KEY:-${HOME}/.ssh/id_ed25519}"
+    local _default_ssh_key="${HOME:-/root}/.ssh/id_ed25519"
+    local _ssh_key="${PUPPET_TRACE_SSH_KEY:-${_default_ssh_key}}"
+    if [[ -n "${PUPPET_TRACE_SSH_KEY:-}" ]]; then
+        _validate_ssh_key_path "$_ssh_key" "$_default_ssh_key" || _ssh_key="$_default_ssh_key"
+    fi
     local _server_container="${PUPPET_TRACE_SERVER_CONTAINER:-puppetserver}"
     _validate_puppet_id "${_server_container}" "PUPPET_TRACE_SERVER_CONTAINER" || return
     _validate_puppet_id "${_ssh_user}" "PUPPET_TRACE_SSH_USER" || return
-    mkdir -m 0700 -p /var/log/puppet-trace/
-    local _ssh_c_opts=(-o ConnectTimeout=10 -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/var/log/puppet-trace/.ssh_known_hosts)
+    mkdir -m 0755 -p /var/log/puppet-trace/
+    local _pt_strict_host="${PUPPET_TRACE_STRICT_HOST_KEY:-accept-new}"
+    case "$_pt_strict_host" in
+        yes|accept-new|no) ;;
+        *) echo "[puppet-trace] WARNING: invalid PUPPET_TRACE_STRICT_HOST_KEY value '$_pt_strict_host' — using accept-new" >&2; _pt_strict_host="accept-new" ;;
+    esac
+    if [[ "$_pt_strict_host" == "accept-new" ]]; then
+        echo "[puppet-trace] WARNING: StrictHostKeyChecking=accept-new (TOFU). Set PUPPET_TRACE_STRICT_HOST_KEY=yes for production." >&2
+    fi
+    local _ssh_c_opts=(-o ConnectTimeout=10 -o BatchMode=yes -o "StrictHostKeyChecking=${_pt_strict_host}" -o UserKnownHostsFile=/var/log/puppet-trace/.ssh_known_hosts)
     [[ -f "$_ssh_key" ]] && _ssh_c_opts+=(-i "$_ssh_key")
 
     echo "[puppet-trace collect] fetching PROFILE entries from $puppet_server since ${since_arg:-last 5000 lines}..."
@@ -450,6 +502,7 @@ _generate_profile_flamegraph() {
     # Our puppetserver container omits [javaclass], so inject a placeholder.
     local normalized_log
     normalized_log=$(mktemp "$(dirname "$svg_out")/puppet-trace-tmp.XXXXX.log")
+    trap 'rm -f "${normalized_log:-}"' RETURN
     sed 's/ Puppet PROFILE/ [puppet.server] Puppet PROFILE/' \
         "$profile_log" > "$normalized_log"
     ruby "$parser" -f flamegraph "$normalized_log" \
@@ -600,8 +653,8 @@ import re as _re
 def _sanitize_svg(s):
     import re as _re
     # Remove <script> blocks including self-closing/unclosed variants
-    s = _re.sub(r'<script\b[^>]*>.*?</script>', '', s, flags=_re.DOTALL|_re.IGNORECASE)
-    s = _re.sub(r'<script\b[^>]*/?\s*>', '', s, flags=_re.IGNORECASE)
+    s = _re.sub(r'<(?:\w+:)?script\b[^>]*>.*?</(?:\w+:)?script>', '', s, flags=_re.DOTALL|_re.IGNORECASE)
+    s = _re.sub(r'<(?:\w+:)?script\b[^>]*/?\s*>', '', s, flags=_re.IGNORECASE)
     # Remove animate/set elements that can animate href to javascript: URIs
     s = _re.sub(r'<(?:animate|set)\b[^>]*/?\s*>', '', s, flags=_re.IGNORECASE)
     s = _re.sub(r'<(?:animate|set)\b.*?</(?:animate|set)>', '', s, flags=_re.DOTALL|_re.IGNORECASE)
@@ -635,6 +688,14 @@ def _sanitize_svg(s):
                        m.group(0), flags=_re.IGNORECASE)
     s = _re.sub(r'style\s*=\s*"[^"]*"', _clean_style_url, s, flags=_re.IGNORECASE)
     s = _re.sub(r"style\s*=\s*'[^']*'", _clean_style_url, s, flags=_re.IGNORECASE)
+    # Also catch unquoted style= values: style=fill:url(javascript:...)
+    s = _re.sub(r'style\s*=\s*([^\s>"\']\S*)', _clean_style_url, s, flags=_re.IGNORECASE)
+    # Sanitize url() in <style> blocks — same allowlist as inline style= attributes
+    def _clean_style_block(m):
+        return _re.sub(r'url\s*\(([^)]*)\)',
+                       lambda u: u.group(0) if u.group(1).strip().startswith('#') else 'url(#)',
+                       m.group(0), flags=_re.IGNORECASE)
+    s = _re.sub(r'<style\b[^>]*>.*?</style>', _clean_style_block, s, flags=_re.DOTALL|_re.IGNORECASE)
     return s
 
 if os.path.isfile(profile_flamegraph_svg) and os.path.getsize(profile_flamegraph_svg) > 0:
@@ -780,7 +841,7 @@ HTML = f'''<!DOCTYPE html>
 </html>
 '''
 
-import os as _os; _old_umask = _os.umask(0o077)
+import os as _os; _old_umask = _os.umask(0o022)
 with open(report_html, 'w') as f:
     f.write(HTML)
 _os.umask(_old_umask)
@@ -794,6 +855,7 @@ PYEOF
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
 OUTDIR="/var/log/puppet-trace/${TIMESTAMP}"
 DRY_RUN=false
+FOLLOW=false
 PUPPET_CMD=()
 POLL_INTERVAL=1.0
 NET_POLL_INTERVAL=2
@@ -816,13 +878,19 @@ Subcommands:
   puppet-trace collect              internal — called by puppet as postrun_command
   puppet-trace report [OUTDIR]      regenerate HTML from existing artifact dir
   puppet-trace ship OUTDIR REMOTE   rsync artifacts + regenerate report on remote
+  puppet-trace demo [--outdir DIR] [--flamegraph SVG]  generate a demo report with mock data (no puppet/root required)
+  puppet-trace diff DIR1 DIR2 [--out FILE] [--html]    diff two run outdirs
     REMOTE = [user@]host:/path
     --include-strace  also ship strace.raw (large; needed for remote re-correlation)
 
 Once-mode options:
-  --dry-run     Skip actual puppet run; generate report from fixture data
-  --outdir DIR  Override output directory (default: /var/log/puppet-trace/<timestamp>/)
-  -- ARGS       Pass remaining args to puppet agent
+  --dry-run                    Skip actual puppet run; generate report from fixture data
+  --follow                     Stream puppet.log lines + I/O stats while puppet runs
+  --outdir DIR                 Override output directory (default: /var/log/puppet-trace/<timestamp>/)
+  --prometheus-textfile FILE   Write Prometheus textfile metrics to FILE after run
+  --push-server HOST:PORT      Push report files to puppet-trace-server after run
+  --enable-profiling HOST:PORT Enable puppetserver profiling before run, disable after
+  -- ARGS                      Pass remaining args to puppet agent
 
 Examples:
   sudo puppet-trace once
@@ -847,6 +915,8 @@ case "$SUBCOMMAND" in
     collect)  shift; cmd_collect "$@"; exit $? ;;
     report)   shift; _LATE_SUBCMD=report; _LATE_ARGS=("$@"); set -- ;;
     ship)     shift; _LATE_SUBCMD=ship;   _LATE_ARGS=("$@"); set -- ;;
+    demo)     shift; _LATE_SUBCMD=demo;   _LATE_ARGS=("$@"); set -- ;;
+    diff)     _LATE_SUBCMD=diff; shift; _LATE_ARGS=("$@"); set -- ;;
     once)     shift ;;  # fall through to legacy/once logic below
     --help|-h) usage ;;
     --dry-run|--outdir|--)
@@ -866,7 +936,11 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --help|-h)   usage ;;
         --dry-run)   DRY_RUN=true; shift ;;
+        --follow)    FOLLOW=true; shift ;;
         --outdir)    OUTDIR="$2"; shift 2 ;;
+        --prometheus-textfile) PROMETHEUS_TEXTFILE="$2"; shift 2 ;;
+        --push-server)    PUSH_SERVER="$2"; shift 2 ;;
+        --enable-profiling) PROFILING_SERVER="$2"; shift 2 ;;
         --)          shift; PUPPET_CMD=("$@"); break ;;
         *)           PUPPET_CMD+=("$1"); shift ;;
     esac
@@ -878,7 +952,7 @@ fi
 
 _validate_safe_path "$OUTDIR" "--outdir" || exit 1
 
-[[ -z "${_LATE_SUBCMD:-}" ]] && mkdir -m 0700 -p "$OUTDIR"
+[[ -z "${_LATE_SUBCMD:-}" ]] && mkdir -m 0755 -p "$OUTDIR"
 PUPPET_LOG="$OUTDIR/puppet.log"
 STRACE_LOG="$OUTDIR/strace.log"
 INOTIFY_LOG="$OUTDIR/inotify.log"
@@ -899,7 +973,11 @@ HAS_PERF=false
 HAS_INOTIFY=false
 HAS_FLAMEGRAPH=false
 HAS_STACKCOLLAPSE=false
+HAS_RBSPY=false
 IS_ROOT=false
+PROMETHEUS_TEXTFILE="${PROMETHEUS_TEXTFILE:-}"
+PUSH_SERVER="${PUSH_SERVER:-}"
+PROFILING_SERVER="${PROFILING_SERVER:-}"
 
 ###############################################################################
 # PROBE CAPABILITIES
@@ -918,6 +996,7 @@ probe_capabilities() {
         [[ $paranoid -le 1 ]] || HAS_PERF=false
     fi
     $IS_ROOT || HAS_STRACE=false
+    if command -v rbspy &>/dev/null; then HAS_RBSPY=true; fi
 }
 
 ###############################################################################
@@ -1074,7 +1153,153 @@ with open(f, 'w') as out:
         out.write(f"{ts} {elapsed:.1f} {rss} {vmpeak} 0 {cpu}\n")
 FIXPY_MEM
 
-    echo "# net snapshot t=0" >"$NET_LOG"
+    # Rich net-poll.log with connection blocks over time
+    python3 - "$NET_LOG" "$base_ts" <<'FIXPY_NET'
+import sys
+out_path = sys.argv[1]
+base_ts = int(sys.argv[2])
+# Simulate: 0-3 connections at start (puppet master + puppetdb),
+# grows to 5 during catalog compile, back to 2 at end
+snapshots = [
+    (base_ts + 0,  [("0100007F:1F90","01"), ("0100007F:1F91","01"),  # loopback (skip)
+                    ("C0A80101:1F90","01"), ("C0A80102:1F91","01")]),  # 2 non-loopback
+    (base_ts + 3,  [("0100007F:1F90","01"),
+                    ("C0A80101:1F90","01"), ("C0A80102:1F91","01"), ("C0A80103:1F92","01")]),  # 3
+    (base_ts + 6,  [("0100007F:1F90","01"),
+                    ("C0A80101:1F90","01"), ("C0A80102:1F91","01"),
+                    ("C0A80103:1F92","01"), ("C0A80104:1F93","01"), ("C0A80105:1F94","01")]),  # 5
+    (base_ts + 9,  [("0100007F:1F90","01"),
+                    ("C0A80101:1F90","01"), ("C0A80102:1F91","01"), ("C0A80103:1F92","01")]),  # 3
+    (base_ts + 12, [("0100007F:1F90","01"),
+                    ("C0A80101:1F90","01"), ("C0A80102:1F91","01")]),  # 2
+    (base_ts + 15, [("0100007F:1F90","01"),
+                    ("C0A80101:1F90","01")]),  # 1
+    (base_ts + 18, [("0100007F:1F90","01")]),  # 0 non-loopback
+]
+with open(out_path, 'w') as f:
+    for ts, conns in snapshots:
+        f.write(f"# ts={ts}\n")
+        for addr, state in conns:
+            f.write(f"{addr} {state}\n")
+FIXPY_NET
+
+    # Rich proc-io-poll.log: 40+ samples spanning the run, write ramps 0->250MB, read ramps 0->50MB
+    python3 - "$OUTDIR/proc-io-poll.log" "$base_ts" <<'FIXPY_IO'
+import sys, math
+out_path = sys.argv[1]
+base_ts = int(sys.argv[2])
+run_dur = 20.0  # seconds
+n_samples = 44  # ~0.5s interval
+max_write = 250 * 1024 * 1024   # 250MB
+max_read  =  50 * 1024 * 1024   # 50MB
+with open(out_path, 'w') as f:
+    for i in range(n_samples):
+        frac = i / (n_samples - 1)
+        # Write ramps up fast during package installs (sigmoid-ish)
+        w_frac = 1 / (1 + math.exp(-10 * (frac - 0.4)))
+        r_frac = frac ** 0.7
+        ts_ms = int((base_ts + frac * run_dur) * 1000)
+        rb = int(r_frac * max_read)
+        wb = int(w_frac * max_write)
+        f.write(f"{ts_ms} {rb} {wb}\n")
+FIXPY_IO
+
+    # Rich pmap output for memory segment analysis
+    cat >"$PMAP_START" <<'FIXPMAP'
+Address           Kbytes     RSS   Dirty Mode  Mapping
+0000555555554000    1024     512     128 r-x-- ruby
+0000555555754000     256     256     256 r---- ruby
+0000555555794000      64      64      64 rw--- ruby
+00007f8800000000   65536   35000   34000 rw---   [ anon ]
+00007f8900000000   32768   18000   18000 rw---   [ heap ]
+00007f8a00000000    8192    4096    2048 rw---   [ heap ]
+00007f8b12340000    2048    1800       0 r-x-- libruby.so.3.1
+00007f8b12540000     256       0       0 ----- libruby.so.3.1
+00007f8b12580000     128     128     128 r---- libruby.so.3.1
+00007f8b125a0000      64      64      64 rw--- libruby.so.3.1
+00007f8b22340000    1024     900       0 r-x-- libc.so.6
+00007f8b22440000     256       0       0 ----- libc.so.6
+00007f8b22480000      64      64      64 r---- libc.so.6
+00007f8b224a0000      32      32      32 rw--- libc.so.6
+00007f8b33340000     512     400       0 r-x-- libssl.so.3
+00007f8b333c0000     128       0       0 ----- libssl.so.3
+00007f8b333e0000      32      32      32 r---- libssl.so.3
+00007f8b333f0000      16      16      16 rw--- libssl.so.3
+00007f8b44340000     256     200       0 r-x-- /opt/puppetlabs/puppet/lib/ruby/gems/3.1/gems/facter-4.6/lib/facter.so
+00007f8b44380000      64       0       0 ----- /opt/puppetlabs/puppet/lib/ruby/gems/3.1/gems/facter-4.6/lib/facter.so
+00007f8b44390000      32      32      32 r---- /opt/puppetlabs/puppet/lib/ruby/gems/3.1/gems/facter-4.6/lib/facter.so
+00007f8b443a0000      16      16      16 rw--- /opt/puppetlabs/puppet/lib/ruby/gems/3.1/gems/facter-4.6/lib/facter.so
+00007ffe00000000     132      16      16 rw---   [ stack ]
+00007ffe1000b000      12       0       0 r----   [ vvar ]
+00007ffe1000e000       8       4       0 r-x--   [ vdso ]
+ffffffffff600000       4       0       0 r-x--   [ vsyscall ]
+---------------- ------- ------- -------
+total kB          112896   61600   55000
+FIXPMAP
+
+    cat >"$PMAP_MID" <<'FIXPMAP2'
+Address           Kbytes     RSS   Dirty Mode  Mapping
+0000555555554000    1024     512     128 r-x-- ruby
+0000555555754000     256     256     256 r---- ruby
+0000555555794000      64      64      64 rw--- ruby
+00007f8800000000   98304   65000   64000 rw---   [ anon ]
+00007f8900000000   49152   38000   38000 rw---   [ heap ]
+00007f8a00000000   16384    9000    9000 rw---   [ heap ]
+00007f8b12340000    2048    1800       0 r-x-- libruby.so.3.1
+00007f8b12540000     256       0       0 ----- libruby.so.3.1
+00007f8b12580000     128     128     128 r---- libruby.so.3.1
+00007f8b125a0000      64      64      64 rw--- libruby.so.3.1
+00007f8b22340000    1024     900       0 r-x-- libc.so.6
+00007f8b22440000     256       0       0 ----- libc.so.6
+00007f8b22480000      64      64      64 r---- libc.so.6
+00007f8b224a0000      32      32      32 rw--- libc.so.6
+00007f8b33340000     512     400       0 r-x-- libssl.so.3
+00007f8b333c0000     128       0       0 ----- libssl.so.3
+00007f8b333e0000      32      32      32 r---- libssl.so.3
+00007f8b333f0000      16      16      16 rw--- libssl.so.3
+00007f8b44340000     256     200       0 r-x-- /opt/puppetlabs/puppet/lib/ruby/gems/3.1/gems/facter-4.6/lib/facter.so
+00007f8b44380000      64       0       0 ----- /opt/puppetlabs/puppet/lib/ruby/gems/3.1/gems/facter-4.6/lib/facter.so
+00007f8b44390000      32      32      32 r---- /opt/puppetlabs/puppet/lib/ruby/gems/3.1/gems/facter-4.6/lib/facter.so
+00007f8b443a0000      16      16      16 rw--- /opt/puppetlabs/puppet/lib/ruby/gems/3.1/gems/facter-4.6/lib/facter.so
+00007ffe00000000     132      16      16 rw---   [ stack ]
+00007ffe1000b000      12       0       0 r----   [ vvar ]
+00007ffe1000e000       8       4       0 r-x--   [ vdso ]
+ffffffffff600000       4       0       0 r-x--   [ vsyscall ]
+---------------- ------- ------- -------
+total kB          170000  116600  111900
+FIXPMAP2
+
+    cat >"$PMAP_END" <<'FIXPMAP3'
+Address           Kbytes     RSS   Dirty Mode  Mapping
+0000555555554000    1024     512     128 r-x-- ruby
+0000555555754000     256     256     256 r---- ruby
+0000555555794000      64      64      64 rw--- ruby
+00007f8800000000   65536   42000   41000 rw---   [ anon ]
+00007f8900000000   32768   22000   22000 rw---   [ heap ]
+00007f8a00000000    8192    5000    5000 rw---   [ heap ]
+00007f8b12340000    2048    1800       0 r-x-- libruby.so.3.1
+00007f8b12540000     256       0       0 ----- libruby.so.3.1
+00007f8b12580000     128     128     128 r---- libruby.so.3.1
+00007f8b125a0000      64      64      64 rw--- libruby.so.3.1
+00007f8b22340000    1024     900       0 r-x-- libc.so.6
+00007f8b22440000     256       0       0 ----- libc.so.6
+00007f8b22480000      64      64      64 r---- libc.so.6
+00007f8b224a0000      32      32      32 rw--- libc.so.6
+00007f8b33340000     512     400       0 r-x-- libssl.so.3
+00007f8b333c0000     128       0       0 ----- libssl.so.3
+00007f8b333e0000      32      32      32 r---- libssl.so.3
+00007f8b333f0000      16      16      16 rw--- libssl.so.3
+00007f8b44340000     256     200       0 r-x-- /opt/puppetlabs/puppet/lib/ruby/gems/3.1/gems/facter-4.6/lib/facter.so
+00007f8b44380000      64       0       0 ----- /opt/puppetlabs/puppet/lib/ruby/gems/3.1/gems/facter-4.6/lib/facter.so
+00007f8b44390000      32      32      32 r---- /opt/puppetlabs/puppet/lib/ruby/gems/3.1/gems/facter-4.6/lib/facter.so
+00007f8b443a0000      16      16      16 rw--- /opt/puppetlabs/puppet/lib/ruby/gems/3.1/gems/facter-4.6/lib/facter.so
+00007ffe00000000     132      16      16 rw---   [ stack ]
+00007ffe1000b000      12       0       0 r----   [ vvar ]
+00007ffe1000e000       8       4       0 r-x--   [ vdso ]
+ffffffffff600000       4       0       0 r-x--   [ vsyscall ]
+---------------- ------- ------- -------
+total kB          108000   73500   68900
+FIXPMAP3
 
     # Strace log with a mix of file ops
     cat >"$STRACE_LOG" <<'FIXEOF'
@@ -1123,30 +1348,46 @@ def rss_at(t):
 
 # Resource definitions: (title, type, status, duration_s, t_offset, disk_w, disk_r, params, file_w, file_r, procs)
 RESOURCES = [
-  ("File[/etc/ssh/sshd_config]",     "File",    "changed",   0.12, 0.0,  4096, 2048,
+  # 2 resources with 0 disk I/O
+  ("File[/etc/ssh/sshd_config]",     "File",    "changed",   0.12, 0.0,  0,    0,
    {"ensure":"file","owner":"root","group":"root","mode":"0600","content":"# managed by Puppet\n..."},
    ["/etc/ssh/sshd_config"], ["/etc/ssh/sshd_config.puppet_tmp"], []),
-  ("File[/etc/motd]",                 "File",    "changed",   0.03, 0.14, 256,  0,
-   {"ensure":"file","owner":"root","group":"root","mode":"0644","content":"Welcome to example.com"},
-   ["/etc/motd"], [], []),
   ("Service[sshd]",                   "Service", "changed",   0.95, 0.18, 0,    0,
    {"ensure":"running","enable":True,"subscribe":"File[/etc/ssh/sshd_config]"},
    [], [], [{"exe":"/usr/bin/systemctl","args":["systemctl","restart","sshd"]}]),
-  ("Package[nginx]",                  "Package", "changed",   2.34, 1.2,  0,    18432000,
+  # 2 resources with ~512KB written
+  ("File[/etc/motd]",                 "File",    "changed",   0.03, 0.14, 524288, 0,
+   {"ensure":"file","owner":"root","group":"root","mode":"0644","content":"Welcome to example.com"},
+   ["/etc/motd"], [], []),
+  ("File[/etc/sysctl.d/99-custom.conf]","File",  "changed",   0.03, 6.65, 524288, 0,
+   {"ensure":"file","owner":"root","mode":"0644","content":"net.ipv4.ip_forward=1\nvm.swappiness=10\n"},
+   ["/etc/sysctl.d/99-custom.conf"], [], []),
+  # 2 resources with ~5MB written
+  ("File[/etc/nginx/nginx.conf]",     "File",    "changed",   0.08, 5.98, 5242880, 4096,
+   {"ensure":"file","owner":"root","group":"root","mode":"0644","source":"puppet:///modules/nginx/nginx.conf"},
+   ["/etc/nginx/nginx.conf"], ["/etc/nginx/nginx.conf.puppet_tmp"], []),
+  ("File[/etc/rsyslog.conf]",         "File",    "changed",   0.06, 10.55, 5242880, 0,
+   {"ensure":"file","owner":"root","group":"root","mode":"0644","source":"puppet:///modules/rsyslog/rsyslog.conf"},
+   ["/etc/rsyslog.conf"], [], []),
+  # 2 resources with ~50MB written, ~10MB read
+  ("Package[nginx]",                  "Package", "changed",   2.34, 1.2,  52428800, 10485760,
    {"ensure":"present","provider":"apt"},
    [], ["/var/cache/apt/archives/nginx_1.24_amd64.deb"], [{"exe":"/usr/bin/apt-get","args":["apt-get","-y","install","nginx"]}]),
+  ("Package[vim]",                    "Package", "changed",   1.87, 3.64, 52428800, 10485760,
+   {"ensure":"present","provider":"apt"},
+   [], ["/var/cache/apt/archives/vim_9.0_amd64.deb"], [{"exe":"/usr/bin/apt-get","args":["apt-get","-y","install","vim"]}]),
+  # 1 resource with ~200MB written (package install simulation)
+  ("Package[docker-ce]",              "Package", "changed",   4.87, 12.44, 209715200, 102400000,
+   {"ensure":"present","provider":"apt"},
+   [], ["/var/cache/apt/archives/docker-ce_24.0_amd64.deb",
+        "/var/cache/apt/archives/containerd.io_1.6_amd64.deb"],
+   [{"exe":"/usr/bin/apt-get","args":["apt-get","-y","install","docker-ce"]}]),
   ("Package[curl]",                   "Package", "unchanged", 0.02, 3.55, 0,    0,    {"ensure":"present"}, [], [], []),
   ("Package[wget]",                   "Package", "unchanged", 0.02, 3.58, 0,    0,    {"ensure":"present"}, [], [], []),
   ("Package[git]",                    "Package", "unchanged", 0.02, 3.61, 0,    0,    {"ensure":"present"}, [], [], []),
-  ("Package[vim]",                    "Package", "changed",   1.87, 3.64, 0,    9216000,
-   {"ensure":"present","provider":"apt"},
-   [], ["/var/cache/apt/archives/vim_9.0_amd64.deb"], [{"exe":"/usr/bin/apt-get","args":["apt-get","-y","install","vim"]}]),
   ("Service[nginx]",                  "Service", "changed",   0.45, 5.52, 0,    0,
    {"ensure":"running","enable":True,"require":"Package[nginx]"},
    [], [], [{"exe":"/usr/bin/systemctl","args":["systemctl","enable","--now","nginx"]}]),
-  ("File[/etc/nginx/nginx.conf]",     "File",    "changed",   0.08, 5.98, 8192, 4096,
-   {"ensure":"file","owner":"root","group":"root","mode":"0644","source":"puppet:///modules/nginx/nginx.conf"},
-   ["/etc/nginx/nginx.conf"], ["/etc/nginx/nginx.conf.puppet_tmp"], []),
   ("File[/etc/nginx/sites-enabled/default]","File","unchanged",0.05,6.07, 0, 0,
    {"ensure":"link","target":"/etc/nginx/sites-available/default"}, [], [], []),
   ("User[deploy]",                    "User",    "changed",   0.14, 6.13, 0,    0,
@@ -1158,9 +1399,6 @@ RESOURCES = [
   ("Exec[sysctl -p]",                 "Exec",    "changed",   0.22, 6.42, 0,    0,
    {"command":"/sbin/sysctl -p","refreshonly":True,"subscribe":"File[/etc/sysctl.d/99-custom.conf]"},
    [], [], [{"exe":"/sbin/sysctl","args":["sysctl","-p"]}]),
-  ("File[/etc/sysctl.d/99-custom.conf]","File",  "changed",   0.03, 6.65, 1024, 0,
-   {"ensure":"file","owner":"root","mode":"0644","content":"net.ipv4.ip_forward=1\nvm.swappiness=10\n"},
-   ["/etc/sysctl.d/99-custom.conf"], [], []),
   ("Package[prometheus-node-exporter]","Package","changed",   3.21, 6.69, 0,    28672000,
    {"ensure":"present","provider":"apt"},
    [], ["/var/cache/apt/archives/prometheus-node-exporter_1.7_amd64.deb"],
@@ -1170,9 +1408,6 @@ RESOURCES = [
   ("File[/etc/default/prometheus-node-exporter]","File","unchanged",0.04,10.47,0,0,
    {"ensure":"file","owner":"root","mode":"0644"}, [], [], []),
   ("Package[rsyslog]",                "Package", "unchanged", 0.02, 10.52,0,    0,    {"ensure":"present"}, [], [], []),
-  ("File[/etc/rsyslog.conf]",         "File",    "changed",   0.06, 10.55,4096, 0,
-   {"ensure":"file","owner":"root","group":"root","mode":"0644","source":"puppet:///modules/rsyslog/rsyslog.conf"},
-   ["/etc/rsyslog.conf"], [], []),
   ("Service[rsyslog]",                "Service", "unchanged", 0.41, 10.62,0,    0,
    {"ensure":"running","enable":True,"subscribe":"File[/etc/rsyslog.conf]"}, [], [], []),
   ("Cron[backup-daily]",              "Cron",    "changed",   0.07, 11.04,0,    0,
@@ -1191,11 +1426,6 @@ RESOURCES = [
   ("Exec[update-ca-certificates]",    "Exec",    "changed",   0.84, 11.59,0,    0,
    {"command":"/usr/sbin/update-ca-certificates","refreshonly":False},
    [], [], [{"exe":"/usr/sbin/update-ca-certificates","args":["update-ca-certificates"]}]),
-  ("Package[docker-ce]",              "Package", "changed",   4.87, 12.44,0,    102400000,
-   {"ensure":"present","provider":"apt"},
-   [], ["/var/cache/apt/archives/docker-ce_24.0_amd64.deb",
-        "/var/cache/apt/archives/containerd.io_1.6_amd64.deb"],
-   [{"exe":"/usr/bin/apt-get","args":["apt-get","-y","install","docker-ce"]}]),
   ("Service[docker]",                 "Service", "changed",   0.67, 17.32,0,    0,
    {"ensure":"running","enable":True,"require":"Package[docker-ce]"},
    [], [], [{"exe":"/usr/bin/systemctl","args":["systemctl","enable","--now","docker"]}]),
@@ -1253,21 +1483,22 @@ FIXPY
     python3 - "$OUTDIR/resource-report.json" <<'FIXPY2'
 import json, sys
 resources = [
-  {"title":"File[/etc/ssh/sshd_config]","type":"File","status":"changed","evaluation_time":0.12,"changed":True,"failed":False,"skipped":False,"out_of_sync":False,"before":"{md5}aabbcc","after":"{md5}112233","parameters":{"ensure":"file","owner":"root","group":"root","mode":"0600"}},
-  {"title":"File[/etc/motd]","type":"File","status":"changed","evaluation_time":0.03,"changed":True,"failed":False,"skipped":False,"out_of_sync":False,"before":None,"after":None,"parameters":{"ensure":"file","owner":"root","mode":"0644","content":"Welcome to example.com"}},
-  {"title":"Service[sshd]","type":"Service","status":"changed","evaluation_time":0.95,"changed":True,"failed":False,"skipped":False,"out_of_sync":False,"before":None,"after":None,"parameters":{"ensure":"running","enable":True}},
-  {"title":"Package[nginx]","type":"Package","status":"changed","evaluation_time":2.34,"changed":True,"failed":False,"skipped":False,"out_of_sync":False,"before":"absent","after":"present","parameters":{"ensure":"present","provider":"apt"}},
-  {"title":"Package[curl]","type":"Package","status":"unchanged","evaluation_time":0.02,"changed":False,"failed":False,"skipped":False,"out_of_sync":False,"before":None,"after":None,"parameters":{"ensure":"present"}},
-  {"title":"Package[wget]","type":"Package","status":"unchanged","evaluation_time":0.02,"changed":False,"failed":False,"skipped":False,"out_of_sync":False,"before":None,"after":None,"parameters":{"ensure":"present"}},
-  {"title":"Package[git]","type":"Package","status":"unchanged","evaluation_time":0.02,"changed":False,"failed":False,"skipped":False,"out_of_sync":False,"before":None,"after":None,"parameters":{"ensure":"present"}},
-  {"title":"Package[vim]","type":"Package","status":"changed","evaluation_time":1.87,"changed":True,"failed":False,"skipped":False,"out_of_sync":False,"before":"absent","after":"present","parameters":{"ensure":"present","provider":"apt"}},
-  {"title":"Service[nginx]","type":"Service","status":"changed","evaluation_time":0.45,"changed":True,"failed":False,"skipped":False,"out_of_sync":False,"before":None,"after":None,"parameters":{"ensure":"running","enable":True}},
-  {"title":"File[/etc/nginx/nginx.conf]","type":"File","status":"changed","evaluation_time":0.08,"changed":True,"failed":False,"skipped":False,"out_of_sync":False,"before":"{md5}old","after":"{md5}new","parameters":{"ensure":"file","owner":"root","mode":"0644","source":"puppet:///modules/nginx/nginx.conf"}},
+  {"title":"File[/etc/ssh/sshd_config]","type":"File","status":"changed","evaluation_time":0.12,"changed":True,"failed":False,"skipped":False,"out_of_sync":False,"before":"{md5}aabbcc112233","after":"{md5}99eeff001122","parameters":{"ensure":"file","owner":"root","group":"root","mode":"0600"},"pdb_source":True,"file":"/etc/puppetlabs/code/environments/production/modules/sshd/manifests/init.pp","line":"42"},
+  {"title":"File[/etc/motd]","type":"File","status":"changed","evaluation_time":0.03,"changed":True,"failed":False,"skipped":False,"out_of_sync":False,"before":"Welcome to old.example.com","after":"Welcome to example.com","parameters":{"ensure":"file","owner":"root","mode":"0644","content":"Welcome to example.com"},"pdb_source":True,"file":"/etc/puppetlabs/code/environments/production/modules/base/manifests/motd.pp","line":"8"},
+  {"title":"Service[sshd]","type":"Service","status":"changed","evaluation_time":0.95,"changed":True,"failed":False,"skipped":False,"out_of_sync":False,"before":"stopped","after":"running","parameters":{"ensure":"running","enable":True},"pdb_source":True},
+  {"title":"Package[nginx]","type":"Package","status":"changed","evaluation_time":2.34,"changed":True,"failed":False,"skipped":False,"out_of_sync":False,"before":"absent","after":"1.24.0-1ubuntu1","parameters":{"ensure":"present","provider":"apt"},"pdb_source":True,"file":"/etc/puppetlabs/code/environments/production/modules/nginx/manifests/init.pp","line":"3"},
+  {"title":"Package[curl]","type":"Package","status":"unchanged","evaluation_time":0.02,"changed":False,"failed":False,"skipped":False,"out_of_sync":False,"before":None,"after":None,"parameters":{"ensure":"present"},"pdb_source":True},
+  {"title":"Package[wget]","type":"Package","status":"unchanged","evaluation_time":0.02,"changed":False,"failed":False,"skipped":False,"out_of_sync":False,"before":None,"after":None,"parameters":{"ensure":"present"},"pdb_source":True},
+  {"title":"Package[git]","type":"Package","status":"unchanged","evaluation_time":0.02,"changed":False,"failed":False,"skipped":False,"out_of_sync":False,"before":None,"after":None,"parameters":{"ensure":"present"},"pdb_source":True},
+  {"title":"Package[vim]","type":"Package","status":"changed","evaluation_time":1.87,"changed":True,"failed":False,"skipped":False,"out_of_sync":False,"before":"absent","after":"2:9.0.1672-1ubuntu2","parameters":{"ensure":"present","provider":"apt"},"pdb_source":True},
+  {"title":"Service[nginx]","type":"Service","status":"changed","evaluation_time":0.45,"changed":True,"failed":False,"skipped":False,"out_of_sync":False,"before":"stopped","after":"running","parameters":{"ensure":"running","enable":True},"pdb_source":True},
+  {"title":"File[/etc/nginx/nginx.conf]","type":"File","status":"changed","evaluation_time":0.08,"changed":True,"failed":False,"skipped":False,"out_of_sync":False,"before":"{md5}deadbeef0000","after":"{md5}cafebabe1234","parameters":{"ensure":"file","owner":"root","mode":"0644","source":"puppet:///modules/nginx/nginx.conf"},"pdb_source":True,"file":"/etc/puppetlabs/code/environments/production/modules/nginx/manifests/config.pp","line":"15"},
 ]
 data = {"resources": resources, "totals": {"resources.total": 40, "resources.changed": 16, "resources.unchanged": 24},
         "config_version": "1716490000", "puppet_version": "8.10.0 (fixture)",
         "transaction_uuid": "fixture-puppet-apply-demo", "status": "changed",
-        "noop": False, "certname": "puppet-agent.example.com", "summary": {}}
+        "noop": False, "certname": "puppet-agent.example.com", "summary": {},
+        "pdb_enriched": True, "pdb_node": "puppet-agent.example.com"}
 with open(sys.argv[1], 'w') as f:
     json.dump(data, f)
 FIXPY2
@@ -1306,7 +1537,14 @@ proc_poller() {
                 cpu=$(( (utime + stime) ))
             fi
         fi
-        echo "$ts $elapsed $rss $vmpeak $vmswap $cpu" >>"$outfile"
+        # Feature 2: smaps_rollup PSS/Private_Dirty
+        local pss=0 private_dirty=0 swap_pss=0
+        if [[ -r /proc/$pid/smaps_rollup ]]; then
+            pss=$(grep '^Pss:' /proc/$pid/smaps_rollup 2>/dev/null | awk '{print $2}' || echo 0)
+            private_dirty=$(grep '^Private_Dirty:' /proc/$pid/smaps_rollup 2>/dev/null | awk '{print $2}' || echo 0)
+            swap_pss=$(grep '^SwapPss:' /proc/$pid/smaps_rollup 2>/dev/null | awk '{print $2}' || echo 0)
+        fi
+        echo "$ts $elapsed $rss $vmpeak $vmswap $cpu $pss $private_dirty $swap_pss" >>"$outfile"
         sleep "$POLL_INTERVAL"
         elapsed=$(echo "$elapsed + $POLL_INTERVAL" | bc 2>/dev/null || echo "?")
     done
@@ -1322,11 +1560,13 @@ net_poller() {
         local ts
         ts=$(date +%s)
         echo "# ts=$ts" >>"$outfile"
-        if command -v ss &>/dev/null; then
-            # -p omitted: process names expose full TCP map across all services (#7471)
+        # Read only the puppet process's TCP connections via /proc to avoid
+        # leaking the full system TCP map into the report (#7471, #7590)
+        if [[ -r /proc/$pid/net/tcp ]]; then
+            awk 'NR>1 {print $3, $4}' /proc/"$pid"/net/tcp 2>/dev/null >>"$outfile" || true
+            [[ -r /proc/$pid/net/tcp6 ]] && awk 'NR>1 {print $3, $4}' /proc/"$pid"/net/tcp6 2>/dev/null >>"$outfile" || true
+        elif command -v ss &>/dev/null; then
             ss -tn 2>/dev/null >>"$outfile" || true
-        elif command -v netstat &>/dev/null; then
-            netstat -tn 2>/dev/null >>"$outfile" || true
         fi
         sleep "$NET_POLL_INTERVAL"
     done
@@ -1410,16 +1650,75 @@ run_puppet() {
         fi
     fi
 
+    # Feature 1: state.yaml health check (PUP-3647: unbounded growth causes 100-250s overhead)
+    local state_yaml="/opt/puppetlabs/puppet/cache/state/state.yaml"
+    local _statesize=0
+    if [[ -f "$state_yaml" ]]; then
+        _statesize=$(stat -c%s "$state_yaml" 2>/dev/null || echo 0)
+        echo "[puppet-trace] state.yaml size: $(( _statesize / 1024 / 1024 ))MB ($(( _statesize / 1024 ))KB)"
+        if (( _statesize > 10485760 )); then  # > 10MB
+            echo "[puppet-trace] WARNING: state.yaml is $(( _statesize / 1024 / 1024 ))MB — PUP-3647 bloat suspected. Large state file adds minutes to run time. Consider: puppet resource file --purge=true ... or truncate after backup." >&2
+        fi
+    fi
+    echo "$_statesize" > "$OUTDIR/state-yaml-size.txt"
+
+    # Feature 6: GC::Profiler injection via RUBYOPT for once-mode
+    GC_PROF_LOG="$OUTDIR/gc-profiler.log"
+    local _gc_shim=""
+    if [[ "${RUBYOPT_GC_PROF:-true}" == "true" ]]; then
+        _gc_shim=$(mktemp --suffix=.rb /tmp/pt_gc_enable_XXXXXXXX) || true
+        if [[ -n "$_gc_shim" ]]; then
+            cat >"$_gc_shim" <<'GCEOF'
+GC::Profiler.enable
+at_exit do
+  $stderr.puts "\n=== PT_GC_PROFILER ==="
+  $stderr.puts GC::Profiler.result
+  $stderr.puts "=== PT_GC_PROFILER_END ==="
+end
+GCEOF
+            chmod 644 "$_gc_shim"
+            export RUBYOPT="-r $_gc_shim${RUBYOPT:+ $RUBYOPT}"
+        fi
+    fi
+
+    "${run_as_user[@]}" "${PUPPET_CMD[@]}" >"$PUPPET_LOG" 2>&1 &
+    PUPPET_PID=$!
+
+    # Feature 3: cgroup v2 accounting — snapshot at run start
+    CGROUP_LOG="$OUTDIR/cgroup-accounting.log"
+    local _cg_path=""
+    if [[ -f /sys/fs/cgroup/cgroup.controllers ]]; then
+        # cgroup v2 unified hierarchy
+        _cg_path=$(awk -F: '$2=="" {print "/sys/fs/cgroup" $3}' /proc/$PUPPET_PID/cgroup 2>/dev/null | head -1)
+        if [[ -z "$_cg_path" ]] && systemctl is-active --quiet puppet 2>/dev/null; then
+            _cg_path=$(systemctl show puppet --property=ControlGroup --value 2>/dev/null)
+            [[ -n "$_cg_path" ]] && _cg_path="/sys/fs/cgroup${_cg_path}"
+        fi
+        if [[ -n "$_cg_path" ]] && [[ -d "$_cg_path" ]]; then
+            {
+                echo "# cgroup_start ts=$(date +%s)"
+                echo "# path=$_cg_path"
+                [[ -r "$_cg_path/cpu.stat" ]]       && echo "=== cpu.stat ===" && cat "$_cg_path/cpu.stat"
+                [[ -r "$_cg_path/memory.current" ]]  && echo "=== memory.current ===" && cat "$_cg_path/memory.current"
+                [[ -r "$_cg_path/io.stat" ]]         && echo "=== io.stat ===" && cat "$_cg_path/io.stat"
+            } >"$CGROUP_LOG" 2>/dev/null || true
+            echo "$_cg_path" >"$OUTDIR/cgroup-path.txt"
+        fi
+    fi
+
+    STRACE_ATTACH_PID=""
     if $HAS_STRACE && $IS_ROOT; then
         echo "[puppet-trace] running puppet under strace (full I/O correlation mode)"
+        # Attach strace to the running puppet PID so we wait on puppet (not strace).
+        # strace -f launched as the root process would hang indefinitely if any
+        # child it forked daemonizes and never exits (#7597).
+        sleep 0.1
         strace -f -ttt -s 0 \
             -e trace=openat,open,read,write,execve,clone,exit_group,connect,sendto,recvfrom \
-            -o "$STRACE_RAW" \
-            "${run_as_user[@]}" "${PUPPET_CMD[@]}" >"$PUPPET_LOG" 2>&1 &
-        PUPPET_PID=$!
-    else
-        "${run_as_user[@]}" "${PUPPET_CMD[@]}" >"$PUPPET_LOG" 2>&1 &
-        PUPPET_PID=$!
+            -p "$PUPPET_PID" \
+            -o "$STRACE_RAW" 2>/dev/null &
+        STRACE_ATTACH_PID=$!
+        _PT_CLEANUP_PIDS+=("$STRACE_ATTACH_PID")
     fi
 
     echo "[puppet-trace] puppet PID=$PUPPET_PID started at $RUN_START_TS"
@@ -1475,6 +1774,17 @@ run_puppet() {
         _PT_CLEANUP_PIDS+=("$PERF_PID")
     fi
 
+    # Feature 5: rbspy Ruby-level flamegraph (if available)
+    RBSPY_PID=""
+    RBSPY_SVG="$OUTDIR/ruby-flamegraph.svg"
+    if ${HAS_RBSPY:-false} && $IS_ROOT; then
+        rbspy record --pid "$PUPPET_PID" --nonblocking \
+            --format flamegraph --file "$RBSPY_SVG" &
+        RBSPY_PID=$!
+        _PT_CLEANUP_PIDS+=("$RBSPY_PID")
+        echo "[puppet-trace] rbspy Ruby-level profiler started (PID=$RBSPY_PID)"
+    fi
+
     # pmap calls: PMAP_START and PMAP_END are synchronous — no cleanup needed.
     # PMAP_MID runs in a background subshell (sleep 10 then snapshot); track its PID (#7515).
     (
@@ -1485,11 +1795,40 @@ run_puppet() {
     PMAP_MID_PID=$!
     _PT_CLEANUP_PIDS+=("$PMAP_MID_PID")
 
+    if $FOLLOW; then
+        local _last_log_line=0 _last_rb=0 _last_wb=0 _tick=0
+        while kill -0 "$PUPPET_PID" 2>/dev/null; do
+            local _elapsed=$(( $(date +%s) - RUN_START_TS ))
+            local _rb _wb _drb _dwb
+            _rb=$(awk '/^read_bytes/{print $2}' /proc/$PUPPET_PID/io 2>/dev/null || echo 0)
+            _wb=$(awk '/^write_bytes/{print $2}' /proc/$PUPPET_PID/io 2>/dev/null || echo 0)
+            _drb=$(( (_rb - _last_rb) / 1024 ))
+            _dwb=$(( (_wb - _last_wb) / 1024 ))
+            _last_rb=$_rb; _last_wb=$_wb
+            # Print new puppet.log lines (strip ANSI, prefix with ">")
+            if [[ -f "$PUPPET_LOG" ]]; then
+                local _total_lines
+                _total_lines=$(wc -l <"$PUPPET_LOG" 2>/dev/null || echo 0)
+                if (( _total_lines > _last_log_line )); then
+                    sed -n "$(( _last_log_line + 1 )),${_total_lines}p" "$PUPPET_LOG" \
+                        | sed 's/\x1b\[[0-9;]*m//g' \
+                        | while IFS= read -r _line; do printf '[puppet] %s\n' "$_line"; done
+                    _last_log_line=$_total_lines
+                fi
+            fi
+            printf '[puppet-trace] elapsed=%ds io_read=%dKB/s io_write=%dKB/s\n' \
+                "$_elapsed" "$_drb" "$_dwb"
+            sleep 5
+        done
+    fi
     wait "$PUPPET_PID"
     PUPPET_EXIT=$?
     true
     RUN_END_TS=$(date +%s)
     WALL_SECONDS=$(( RUN_END_TS - RUN_START_TS ))
+
+    # Detach strace now that puppet exited; don't let it hang on daemonized children.
+    [[ -n "${STRACE_ATTACH_PID:-}" ]] && kill "$STRACE_ATTACH_PID" 2>/dev/null || true
 
     pmap -x "$PUPPET_PID" >"$PMAP_END" 2>/dev/null || echo "(pmap unavailable)" >"$PMAP_END"
 
@@ -1498,6 +1837,7 @@ run_puppet() {
     [[ -n "${IO_POLLER_PID:-}" ]]   && kill "$IO_POLLER_PID"   2>/dev/null || true
     [[ -n "${STRACE_PID:-}" ]]       && kill "$STRACE_PID"       2>/dev/null || true
     [[ -n "${PERF_PID:-}" ]]         && kill "$PERF_PID"         2>/dev/null || true
+    [[ -n "${RBSPY_PID:-}" ]]        && kill "$RBSPY_PID"        2>/dev/null || true
     wait 2>/dev/null || true
 
     # Snapshot /proc/meminfo + df after run
@@ -1510,6 +1850,52 @@ run_puppet() {
         ss -tn 2>/dev/null || true
     } >"$OUTDIR/sysctx-after.txt" 2>/dev/null || true
 
+    # Feature 3: cgroup v2 accounting — snapshot at run end
+    if [[ -n "${_cg_path:-}" ]] && [[ -d "$_cg_path" ]]; then
+        {
+            echo "# cgroup_end ts=$(date +%s)"
+            [[ -r "$_cg_path/cpu.stat" ]]       && echo "=== cpu.stat ===" && cat "$_cg_path/cpu.stat"
+            [[ -r "$_cg_path/memory.current" ]]  && echo "=== memory.current ===" && cat "$_cg_path/memory.current"
+            [[ -r "$_cg_path/io.stat" ]]         && echo "=== io.stat ===" && cat "$_cg_path/io.stat"
+        } >>"$CGROUP_LOG" 2>/dev/null || true
+    fi
+
+    # Feature 4: Facter timing — capture facter --timing output if Facter 4.x
+    FACTER_TIMING_LOG="$OUTDIR/facter-timing.log"
+    if command -v facter &>/dev/null; then
+        facter --timing 2>"$FACTER_TIMING_LOG" >/dev/null || true
+        if [[ ! -s "$FACTER_TIMING_LOG" ]]; then
+            FACTER_TIMING="(facter --timing produced no output — may be Facter < 4.x or puppetlabs facter)"
+            echo "$FACTER_TIMING" >"$FACTER_TIMING_LOG"
+        fi
+    fi
+
+    # Feature 4: Pre-catalog gap — time from process start to first connect() in strace
+    PRECATALOG_SECS=""
+    if [[ -f "$STRACE_RAW" ]]; then
+        local _first_connect_ts
+        _first_connect_ts=$(grep -m1 'connect(' "$STRACE_RAW" 2>/dev/null | awk '{print $2}' | head -1)
+        if [[ -n "$_first_connect_ts" ]]; then
+            local _first_ts_sec="${_first_connect_ts%%.*}"
+            PRECATALOG_SECS=$(( _first_ts_sec - RUN_START_TS ))
+            echo "$PRECATALOG_SECS" >"$OUTDIR/facter-gap-secs.txt"
+            echo "[puppet-trace] pre-catalog gap (facter+init): ${PRECATALOG_SECS}s"
+        fi
+    fi
+
+    # Feature 6: Extract GC::Profiler output from puppet.log and clean up shim
+    if [[ -n "${_gc_shim:-}" ]]; then
+        unset RUBYOPT
+        rm -f "$_gc_shim" 2>/dev/null || true
+        if grep -q 'PT_GC_PROFILER' "$PUPPET_LOG" 2>/dev/null; then
+            sed -n '/=== PT_GC_PROFILER ===/,/=== PT_GC_PROFILER_END ===/p' \
+                "$PUPPET_LOG" >"$GC_PROF_LOG" 2>/dev/null || true
+            echo "[puppet-trace] GC::Profiler data captured → $GC_PROF_LOG"
+        else
+            echo "(GC::Profiler output not found — may not be Ruby 2.x+)" >"$GC_PROF_LOG"
+        fi
+    fi
+
     echo "[puppet-trace] puppet exited with code $PUPPET_EXIT after ${WALL_SECONDS}s"
     _restart_puppet_service
 }
@@ -1521,9 +1907,10 @@ save_run_meta() {
     python3 - "$OUTDIR/run-meta.json" \
         "$WALL_SECONDS" "$PUPPET_EXIT" "${PUPPET_CMD[*]}" \
         "$IDEMPOTENCY_PASS" "$IDEMPOTENCY_CHANGES" "${RUN_START_ISO:-}" \
-        "$TIMESTAMP" <<'PYEOF_META'
-import json, sys
-out = sys.argv[1]
+        "$TIMESTAMP" "$OUTDIR/resource-report.json" <<'PYEOF_META'
+import json, sys, os
+out  = sys.argv[1]
+rr_path = sys.argv[9] if len(sys.argv) > 9 else ''
 data = {
     'wall_seconds':        int(sys.argv[2]),
     'puppet_exit':         int(sys.argv[3]),
@@ -1533,6 +1920,18 @@ data = {
     'run_start_iso':       sys.argv[7],
     'timestamp':           sys.argv[8],
 }
+if rr_path and os.path.isfile(rr_path):
+    try:
+        rr = json.load(open(rr_path))
+        resources = rr.get('resources', [])
+        data['res_total']     = len(resources)
+        data['res_changed']   = sum(1 for r in resources if r.get('changed'))
+        data['res_failed']    = sum(1 for r in resources if r.get('failed'))
+        data['res_skipped']   = sum(1 for r in resources if r.get('skipped'))
+        data['pdb_enriched']  = rr.get('pdb_enriched', False)
+        data['pdb_node']      = rr.get('pdb_node', '')
+    except Exception:
+        pass
 with open(out, 'w') as f:
     json.dump(data, f, indent=2)
 print(f"[puppet-trace] run-meta.json saved: {out}", file=__import__('sys').stderr)
@@ -1687,9 +2086,31 @@ enrich_from_puppetdb() {
         _validate_puppet_id "$puppet_server" "puppet_server" || puppet_server=""
     fi
     [[ -z "$puppet_server" ]] && { echo "[puppet-trace] ERROR: could not determine puppet server for PuppetDB enrichment" >&2; return 1; }
-    ssh_user="${PUPPET_TRACE_SSH_USER:-puppet}"
-    ssh_key="${PUPPET_TRACE_SSH_KEY:-${HOME}/.ssh/id_ed25519}"
-    local _pdb_container="${PUPPET_TRACE_PDB_CONTAINER:-puppetdb}"
+    ssh_user="${PUPPET_TRACE_SSH_USER:-${SUDO_USER:-puppet}}"
+    local _pdb_sudo_key=""
+    if [[ -n "${SUDO_USER:-}" ]]; then
+        local _pdb_sudo_home
+        _pdb_sudo_home=$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6 || true)
+        [[ -n "$_pdb_sudo_home" ]] && _pdb_sudo_key="${_pdb_sudo_home}/.ssh/id_ed25519"
+    fi
+    local _pdb_default_key="${HOME:-/root}/.ssh/id_ed25519"
+    if [[ ! -f "$_pdb_default_key" ]] && [[ -f "${_pdb_sudo_key:-}" ]]; then
+        _pdb_default_key="$_pdb_sudo_key"
+    fi
+    ssh_key="${PUPPET_TRACE_SSH_KEY:-${_pdb_default_key}}"
+    if [[ -n "${PUPPET_TRACE_SSH_KEY:-}" ]]; then
+        _validate_ssh_key_path "$ssh_key" "$_pdb_default_key" || ssh_key="$_pdb_default_key"
+    fi
+    local _pdb_container="${PUPPET_TRACE_PDB_CONTAINER:-}"
+    if [[ -z "$_pdb_container" ]] && [[ -n "${PUSH_SERVER:-}" ]]; then
+        _pdb_container=$(curl -sf --max-time 3 \
+            "http://${PUSH_SERVER}/api/profiling/status" \
+            2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('pdb_container_name',''))" 2>/dev/null || true)
+    fi
+    if [[ -z "$_pdb_container" ]]; then
+        echo "[puppet-trace] PuppetDB not configured — skipping enrichment" >&2
+        return
+    fi
     _validate_puppet_id "${_pdb_container}" "PUPPET_TRACE_PDB_CONTAINER" || return
     _validate_puppet_id "${ssh_user}" "PUPPET_TRACE_SSH_USER" || return
     # Validate puppet identifiers before use in SSH commands
@@ -1698,17 +2119,33 @@ enrich_from_puppetdb() {
     local certname_enc transaction_uuid_enc
     certname_enc=$(python3 -c "import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1]))" "$certname")
     [[ -n "$transaction_uuid" ]] && transaction_uuid_enc=$(python3 -c "import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1]))" "$transaction_uuid") || transaction_uuid_enc=""
-    mkdir -m 0700 -p /var/log/puppet-trace/
-    _ssh_opts=(-o ConnectTimeout=5 -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/var/log/puppet-trace/.ssh_known_hosts)
+    mkdir -m 0755 -p /var/log/puppet-trace/
+    local _pdb_strict_host="${PUPPET_TRACE_STRICT_HOST_KEY:-accept-new}"
+    case "$_pdb_strict_host" in
+        yes|accept-new|no) ;;
+        *) echo "[puppet-trace] WARNING: invalid PUPPET_TRACE_STRICT_HOST_KEY '$_pdb_strict_host' — using accept-new" >&2
+           _pdb_strict_host="accept-new" ;;
+    esac
+    if [[ "$_pdb_strict_host" == "accept-new" ]]; then
+        echo "[puppet-trace] WARNING: StrictHostKeyChecking=accept-new (TOFU). Set PUPPET_TRACE_STRICT_HOST_KEY=yes for production." >&2
+    fi
+    _ssh_opts=(-o ConnectTimeout=5 -o BatchMode=yes -o "StrictHostKeyChecking=${_pdb_strict_host}" -o UserKnownHostsFile=/var/log/puppet-trace/.ssh_known_hosts)
     [[ -f "$ssh_key" ]] && _ssh_opts+=(-i "$ssh_key")
 
     echo "[puppet-trace] querying PuppetDB on $puppet_server for $certname..."
 
-    local pdb_json
+    local pdb_json _pdb_stderr
+    _pdb_stderr=$(mktemp)
     pdb_json=$(ssh "${_ssh_opts[@]}" "${ssh_user}@${puppet_server}" \
         "docker exec ${_pdb_container} curl -sf \
          'http://localhost:8080/pdb/query/v4/resources?query=%5B%22%3D%22%2C%22certname%22%2C%22${certname_enc}%22%5D'" \
-        2>/dev/null) || { echo "[puppet-trace] PuppetDB SSH query failed — using local data only" >&2; return; }
+        2>"$_pdb_stderr") || {
+        local _pdb_err; _pdb_err=$(cat "$_pdb_stderr" 2>/dev/null | head -1)
+        rm -f "$_pdb_stderr"
+        echo "[puppet-trace] PuppetDB query failed (container=${_pdb_container}): ${_pdb_err:-ssh error} — skipping" >&2
+        return
+    }
+    rm -f "$_pdb_stderr"
 
     local event_json=""
     if [[ -n "$transaction_uuid" ]]; then
@@ -1731,8 +2168,8 @@ enrich_from_puppetdb() {
     local _pdb_tmp _evt_tmp
     _pdb_tmp=$(mktemp "${OUTDIR}/puppet-trace-tmp.XXXXX.json")
     _evt_tmp=$(mktemp "${OUTDIR}/puppet-trace-tmp.XXXXX.json")
-    echo "$pdb_json" > "$_pdb_tmp"
-    echo "${event_json:-[]}" > "$_evt_tmp"
+    printf '%s\n' "$pdb_json" > "$_pdb_tmp"
+    printf '%s\n' "${event_json:-[]}" > "$_evt_tmp"
 
     python3 - "$rr_json" "$_pdb_tmp" "$_evt_tmp" <<'PYEOF_PDB'
 import json, sys, os
@@ -1782,9 +2219,12 @@ for r in (pdb_res if isinstance(pdb_res, list) else []):
         'file':            r.get('file') or '',
         'line':            str(r.get('line') or ''),
         'parameters':      r.get('parameters') or {},
+        'pdb_source':      True,
     })
 
 rr['resources'] = resources
+rr['pdb_enriched'] = True
+rr['pdb_node'] = rr.get('certname', '')
 with open(rr_path, 'w') as f:
     json.dump(rr, f, indent=2)
 print(f"[puppet-trace] PuppetDB enrichment: {len(resources)} resources", file=sys.stderr)
@@ -2140,15 +2580,77 @@ for w in windows:
         **rss,
     })
 
+# ── Feature 9: Augeas lens detection per resource ────────────────────────────
+def count_augeas_lenses(events_for_window):
+    """Count augeas lens file opens — indicates no incl: guard."""
+    return sum(1 for e in events_for_window
+               if '/augeas/lenses/' in e.get('path', '') or '/usr/share/augeas/' in e.get('path', ''))
+
+# ── Feature 7: HTTP phase decomposition from strace sendto/write buffers ──────
+def parse_http_phases(strace_events_list, run_start_ts):
+    """Extract HTTP phase timing from strace sendto/write buffers."""
+    phases = []
+    http_verb_re = re.compile(r'(GET|POST|PUT|DELETE)\s+(/puppet/v3/\S+)\s+HTTP')
+    ts_re = re.compile(r'^(\d+\.\d+)')
+
+    for ev in strace_events_list:
+        if ev['syscall'] not in ('sendto', 'write'):
+            continue
+        path = ev.get('path', '')
+        # strace with -s 0 captures full payload in path field for sendto
+        hm = http_verb_re.search(path)
+        if not hm:
+            continue
+        verb = hm.group(1)
+        url_path = hm.group(2)
+        ts = ev['ts']
+        if '/node' in url_path:
+            phase = 'node_classify'
+        elif '/catalog' in url_path and verb == 'POST':
+            phase = 'catalog_request'
+        elif '/file_metadata' in url_path or '/file_content' in url_path:
+            phase = 'file_resource'
+        elif '/report' in url_path and verb == 'PUT':
+            phase = 'report_submit'
+        elif '/facts' in url_path:
+            phase = 'facts_upload'
+        else:
+            phase = 'other_http'
+        phases.append({'ts': ts - run_start_ts, 'phase': phase, 'verb': verb, 'path': url_path})
+    return phases
+
+http_phases = parse_http_phases(strace_events, min_ts)
+print(f"[corr] HTTP phases detected: {len(http_phases)}")
+
+# Augeas + re-correlate to add augeas_lens_count per resource
+# Build per-window event lists for augeas counting
+for i, w in enumerate(windows):
+    t0, t1 = w['t_start'], w['t_end']
+    if t1 <= t0:
+        t1 = t0 + 0.001
+    evs_in = [e for e in strace_events if t0 <= e['ts'] < t1]
+    correlated[i]['augeas_lens_count'] = count_augeas_lenses(evs_in)
+
 # sort by disk_bytes_written desc for summary
 correlated.sort(key=lambda r: -r['disk_bytes_written'])
 
 total_strace_events = len(strace_events)
 print(f"[corr] correlated {len(correlated)} resources, {total_strace_events} strace events total")
 
+output_data = {
+    'resources': correlated,
+    'http_phases': http_phases,
+}
+
 with open(out_json, 'w') as f:
     json.dump(correlated, f, indent=2, default=str)
+# Also save http_phases separately for the report
+import os as _os
+http_phases_path = _os.path.join(_os.path.dirname(out_json), 'http-phases.json')
+with open(http_phases_path, 'w') as f:
+    json.dump(http_phases, f, indent=2)
 print(f"[corr] written: {out_json}")
+print(f"[corr] http-phases: {http_phases_path}")
 PYEOF
     echo "[puppet-trace] strace correlation done: $IO_CORR_JSON"
 }
@@ -2242,13 +2744,48 @@ collect_profile_flamegraph() {
     [[ -z "$puppet_server" ]] && puppet_server="$(hostname -f 2>/dev/null || hostname)"
     _validate_puppet_id "$puppet_server" "puppet_server" || puppet_server=""
     [[ -z "$puppet_server" ]] && { echo "[puppet-trace] ERROR: could not determine puppet server for profile flamegraph" >&2; return 1; }
-    local _ssh_user2="${PUPPET_TRACE_SSH_USER:-puppet}"
-    ssh_key="${PUPPET_TRACE_SSH_KEY:-${HOME}/.ssh/id_ed25519}"
-    local _server_container2="${PUPPET_TRACE_SERVER_CONTAINER:-puppetserver}"
+    local _ssh_user2="${PUPPET_TRACE_SSH_USER:-${SUDO_USER:-puppet}}"
+    # When running via sudo, $HOME is /root but the invoking user's key
+    # is the one authorised on the puppet server. Fall through:
+    # 1. PUPPET_TRACE_SSH_KEY env var (explicit override)
+    # 2. $HOME/.ssh/id_ed25519 (works for direct root or explicit sudo -E)
+    # 3. SUDO_USER's home key (sudo without -E; most common case)
+    local _sudo_user_key=""
+    if [[ -n "${SUDO_USER:-}" ]]; then
+        local _sudo_home
+        _sudo_home=$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6 || true)
+        [[ -n "$_sudo_home" ]] && _sudo_user_key="${_sudo_home}/.ssh/id_ed25519"
+    fi
+    local _fg_default_key="${HOME:-/root}/.ssh/id_ed25519"
+    if [[ ! -f "$_fg_default_key" ]] && [[ -f "${_sudo_user_key:-}" ]]; then
+        _fg_default_key="$_sudo_user_key"
+    fi
+    ssh_key="${PUPPET_TRACE_SSH_KEY:-${_fg_default_key}}"
+    if [[ -n "${PUPPET_TRACE_SSH_KEY:-}" ]]; then
+        _validate_ssh_key_path "$ssh_key" "$_fg_default_key" || ssh_key="$_fg_default_key"
+    fi
+    # If PUPPET_TRACE_SERVER_CONTAINER not set explicitly, query puppet-trace-server
+    # for the container name it knows about (avoids hardcoding runecorps-puppetserver).
+    local _server_container2="${PUPPET_TRACE_SERVER_CONTAINER:-}"
+    if [[ -z "$_server_container2" ]] && [[ -n "${PUSH_SERVER:-}" ]]; then
+        _server_container2=$(curl -sf --max-time 3 \
+            "http://${PUSH_SERVER}/api/profiling/status" \
+            2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('container_name',''))" 2>/dev/null || true)
+    fi
+    [[ -z "$_server_container2" ]] && _server_container2="${PUPPET_TRACE_SERVER_CONTAINER:-puppetserver}"
     _validate_puppet_id "${_server_container2}" "PUPPET_TRACE_SERVER_CONTAINER" || return
     _validate_puppet_id "${_ssh_user2}" "PUPPET_TRACE_SSH_USER" || return
-    mkdir -m 0700 -p /var/log/puppet-trace/
-    _ssh_opts=(-o ConnectTimeout=10 -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/var/log/puppet-trace/.ssh_known_hosts)
+    mkdir -m 0755 -p /var/log/puppet-trace/
+    local _fg_strict_host="${PUPPET_TRACE_STRICT_HOST_KEY:-accept-new}"
+    case "$_fg_strict_host" in
+        yes|accept-new|no) ;;
+        *) echo "[puppet-trace] WARNING: invalid PUPPET_TRACE_STRICT_HOST_KEY '$_fg_strict_host' — using accept-new" >&2
+           _fg_strict_host="accept-new" ;;
+    esac
+    if [[ "$_fg_strict_host" == "accept-new" ]]; then
+        echo "[puppet-trace] WARNING: StrictHostKeyChecking=accept-new (TOFU). Set PUPPET_TRACE_STRICT_HOST_KEY=yes for production." >&2
+    fi
+    _ssh_opts=(-o ConnectTimeout=10 -o BatchMode=yes -o "StrictHostKeyChecking=${_fg_strict_host}" -o UserKnownHostsFile=/var/log/puppet-trace/.ssh_known_hosts)
     [[ -f "$ssh_key" ]] && _ssh_opts+=(-i "$ssh_key")
 
     if [[ -n "$start_iso" ]] && [[ ! "$start_iso" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z?$ ]]; then
@@ -2359,8 +2896,13 @@ if resource_report_json and os.path.isfile(resource_report_json):
         rr_trans_uuid = rrd.get('transaction_uuid', '')
         rr_pversion   = rrd.get('puppet_version', '')
         rr_status     = rrd.get('status', '')
+        rr_pdb_enriched = rrd.get('pdb_enriched', False)
+        rr_pdb_node     = rrd.get('pdb_node', '')
     except Exception:
         pass
+else:
+    rr_pdb_enriched = False
+    rr_pdb_node     = ''
 
 # ── idempotency stdout ────────────────────────────────────────────────────────
 idem_lines = []
@@ -2378,12 +2920,111 @@ if sysctx_after and os.path.isfile(sysctx_after):
     with open(sysctx_after) as f:
         sysctx_after_text = f.read()
 
+# ── Feature 1: state.yaml size ───────────────────────────────────────────────
+state_yaml_size = 0
+state_yaml_size_path = os.path.join(outdir, 'state-yaml-size.txt')
+if os.path.isfile(state_yaml_size_path):
+    try:
+        state_yaml_size = int(open(state_yaml_size_path).read().strip())
+    except Exception:
+        pass
+
+# ── Feature 2/6: cgroup accounting log ───────────────────────────────────────
+cgroup_log_text = ''
+cgroup_log_path = os.path.join(outdir, 'cgroup-accounting.log')
+if os.path.isfile(cgroup_log_path):
+    with open(cgroup_log_path, errors='replace') as f:
+        cgroup_log_text = f.read()
+
+# ── Feature 4: facter gap ────────────────────────────────────────────────────
+facter_gap_secs = None
+facter_gap_path = os.path.join(outdir, 'facter-gap-secs.txt')
+if os.path.isfile(facter_gap_path):
+    try:
+        facter_gap_secs = int(open(facter_gap_path).read().strip())
+    except Exception:
+        pass
+
+facter_timing_text = ''
+facter_timing_path = os.path.join(outdir, 'facter-timing.log')
+if os.path.isfile(facter_timing_path):
+    with open(facter_timing_path, errors='replace') as f:
+        facter_timing_text = f.read()
+
+# ── Feature 6: GC profiler ───────────────────────────────────────────────────
+gc_profiler_text = ''
+gc_profiler_path = os.path.join(outdir, 'gc-profiler.log')
+if os.path.isfile(gc_profiler_path):
+    with open(gc_profiler_path, errors='replace') as f:
+        gc_profiler_text = f.read()
+
+# ── Feature 5: rbspy flamegraph ──────────────────────────────────────────────
+rbspy_svg_path = os.path.join(outdir, 'ruby-flamegraph.svg')
+
+# ── Features 7/8: HTTP phases ────────────────────────────────────────────────
+http_phases = []
+http_phases_path = os.path.join(outdir, 'http-phases.json')
+if os.path.isfile(http_phases_path):
+    try:
+        http_phases = json.load(open(http_phases_path))
+    except Exception:
+        pass
+
 def fmt_bytes(n):
     for unit in ('B','KB','MB','GB','TB'):
         if abs(n) < 1024:
             return f'{n:.1f} {unit}'
         n /= 1024
     return f'{n:.1f} PB'
+
+# ── parse proc-io-poll.log ────────────────────────────────────────────────────
+io_poll_points = []  # [(ts_ms, read_bytes_cumul, write_bytes_cumul)]
+io_poll_path = os.path.join(outdir, 'proc-io-poll.log')
+if os.path.isfile(io_poll_path):
+    with open(io_poll_path) as f:
+        for line in f:
+            parts = line.split()
+            if len(parts) >= 3:
+                try:
+                    io_poll_points.append((int(parts[0]), int(parts[1]), int(parts[2])))
+                except (ValueError, IndexError):
+                    pass
+
+# ── parse net-poll.log for connection count over time ────────────────────────
+net_blocks = []  # [(unix_ts, connection_count)]
+if os.path.isfile(net_log):
+    _cur_ts = None
+    _cur_conns = []
+    with open(net_log) as _f:
+        for _line in _f:
+            _line = _line.rstrip()
+            if _line.startswith('# ts='):
+                if _cur_ts is not None:
+                    # Count non-loopback: 127.0.0.1 in little-endian hex = 0100007F
+                    _cnt = sum(1 for _a in _cur_conns if not _a.upper().startswith('0100007F'))
+                    net_blocks.append((_cur_ts, _cnt))
+                try:
+                    _cur_ts = int(_line.split('=')[1])
+                except (ValueError, IndexError):
+                    _cur_ts = None
+                _cur_conns = []
+            else:
+                _parts = _line.split()
+                if _parts:
+                    _cur_conns.append(_parts[0])
+    if _cur_ts is not None:
+        _cnt = sum(1 for _a in _cur_conns if not _a.upper().startswith('0100007F'))
+        net_blocks.append((_cur_ts, _cnt))
+
+# ── read pmap snapshots ────────────────────────────────────────────────────────
+pmap_texts = []
+for _pf in ['pmap-start.txt', 'pmap-mid.txt', 'pmap-end.txt']:
+    _pp = os.path.join(outdir, _pf)
+    if os.path.isfile(_pp):
+        with open(_pp) as _f:
+            pmap_texts.append(_f.read())
+    else:
+        pmap_texts.append('')
 
 # ── derive summary numbers ────────────────────────────────────────────────────
 total_disk_written = sum(r.get('disk_bytes_written', 0) for r in io_resources)
@@ -2395,22 +3036,45 @@ res_skipped = sum(1 for r in rr_resources if r.get('skipped'))
 res_total   = len(rr_resources)
 
 # Use resource list: prefer io_resources (has strace), fall back to rr_resources
-display_resources = io_resources if io_resources else [
-    {
-        'title':              r['title'],
-        'type':               r.get('type', ''),
-        'status':             r.get('status', 'unknown'),
-        'duration_s':         r.get('evaluation_time', 0),
-        'disk_bytes_written': 0,
-        'disk_bytes_read':    0,
-        'processes':          [],
-        'files_written':      [],
-        'files_read':         [],
-        'network_connections': [],
-        'strace_events':      0,
-    }
-    for r in rr_resources
-]
+# Build a lookup of PDB-enriched fields by resource title
+_rr_by_title = {r['title']: r for r in rr_resources}
+
+def _merge_pdb(d):
+    """Copy PDB fields (before/after/parameters/pdb_source/file/line) from rr_resources into a display dict."""
+    rr = _rr_by_title.get(d.get('title', ''), {})
+    out = dict(d)
+    for k in ('before', 'after', 'parameters', 'pdb_source', 'file', 'line'):
+        if k not in out or not out[k]:
+            v = rr.get(k)
+            if v:
+                out[k] = v
+    return out
+
+if io_resources:
+    display_resources = [_merge_pdb(r) for r in io_resources]
+else:
+    display_resources = [
+        {
+            'title':              r['title'],
+            'type':               r.get('type', ''),
+            'status':             r.get('status', 'unknown'),
+            'duration_s':         r.get('evaluation_time', 0),
+            'disk_bytes_written': 0,
+            'disk_bytes_read':    0,
+            'processes':          [],
+            'files_written':      [],
+            'files_read':         [],
+            'network_connections': [],
+            'strace_events':      0,
+            'before':             r.get('before'),
+            'after':              r.get('after'),
+            'parameters':         r.get('parameters') or {},
+            'pdb_source':         r.get('pdb_source', False),
+            'file':               r.get('file', ''),
+            'line':               r.get('line', ''),
+        }
+        for r in rr_resources
+    ]
 
 strace_total_events = sum(r.get('strace_events', 0) for r in io_resources)
 
@@ -2557,6 +3221,383 @@ def make_line_chart(points, title, ylabel, color, width=700, height=200):
     svg.append('</svg>')
     return '\n'.join(svg)
 
+def make_resource_timeline(io_resources, width=1000):
+    """Gantt chart: one row per resource sorted by t_start. Bar color = log-scale disk I/O."""
+    import math as _math
+    if not io_resources:
+        return '<div class="chart-empty">No I/O resource data for timeline.</div>'
+    resources = sorted(io_resources, key=lambda r: r.get('t_start', 0))
+    if not resources:
+        return '<div class="chart-empty">No resources with timing data.</div>'
+    t_min = min(r.get('t_start', 0) for r in resources)
+    t_max = max(r.get('t_end', r.get('t_start', 0)) for r in resources)
+    if t_max <= t_min:
+        t_max = t_min + 1
+    row_h = 20
+    pad_l = 220
+    pad_r = 20
+    pad_t = 36
+    pad_b = 60
+    n = len(resources)
+    height = pad_t + n * row_h + pad_b
+    pw = width - pad_l - pad_r
+
+    def tx(t):
+        return pad_l + (t - t_min) / (t_max - t_min) * pw
+
+    def io_color(dw, dr):
+        total = dw + dr
+        if total == 0:
+            return '#aaa'
+        # log scale: 1KB=blue, 1MB=between, 10MB=orange, 100MB=red
+        log_val = _math.log10(max(total, 1))
+        # range: 3 (1KB) to 8 (100MB)
+        frac = max(0.0, min(1.0, (log_val - 3) / 5))
+        if frac < 0.33:
+            # blue to cyan
+            r = int(74 + (0 - 74) * frac / 0.33)
+            g = int(144 + (200 - 144) * frac / 0.33)
+            b = int(217 + (255 - 217) * frac / 0.33)
+        elif frac < 0.66:
+            # cyan to orange
+            ff = (frac - 0.33) / 0.33
+            r = int(0 + (255 - 0) * ff)
+            g = int(200 + (140 - 200) * ff)
+            b = int(255 + (0 - 255) * ff)
+        else:
+            # orange to red
+            ff = (frac - 0.66) / 0.34
+            r = 255
+            g = int(140 + (0 - 140) * ff)
+            b = 0
+        return f'rgb({r},{g},{b})'
+
+    svg = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
+           f'style="background:#fff;border:1px solid #e0e0e0;border-radius:4px;display:block">']
+    svg.append(f'<text x="{(pad_l+width-pad_r)//2}" y="16" text-anchor="middle" '
+               f'font-family="monospace" font-size="12" font-weight="bold">Resource I/O Timeline</text>')
+    svg.append(f'<text x="{(pad_l+width-pad_r)//2}" y="30" text-anchor="middle" '
+               f'font-family="monospace" font-size="10" fill="#666">'
+               f'color = total disk I/O (gray=none, blue=small, red=large)</text>')
+    # axes
+    svg.append(f'<line x1="{pad_l}" y1="{pad_t}" x2="{pad_l}" y2="{height-pad_b}" stroke="#bbb" stroke-width="1"/>')
+    svg.append(f'<line x1="{pad_l}" y1="{height-pad_b}" x2="{width-pad_r}" y2="{height-pad_b}" stroke="#bbb" stroke-width="1"/>')
+    # x-axis ticks
+    elapsed_total = t_max - t_min
+    for frac in [0, 0.25, 0.5, 0.75, 1.0]:
+        xv = t_min + frac * elapsed_total
+        xx = tx(xv)
+        svg.append(f'<line x1="{xx:.1f}" y1="{height-pad_b}" x2="{xx:.1f}" y2="{height-pad_b+4}" stroke="#888"/>')
+        svg.append(f'<text x="{xx:.1f}" y="{height-pad_b+14}" text-anchor="middle" '
+                   f'font-family="monospace" font-size="10">{frac*elapsed_total:.0f}s</text>')
+    # rows
+    for i, r in enumerate(resources):
+        y = pad_t + i * row_h
+        label = r.get('title', '')[:30]
+        x1 = tx(r.get('t_start', t_min))
+        x2 = tx(r.get('t_end', r.get('t_start', t_min)))
+        bw = max(x2 - x1, 2.0)
+        dw = r.get('disk_bytes_written', 0)
+        dr = r.get('disk_bytes_read', 0)
+        col = io_color(dw, dr)
+        dur = r.get('duration_s', 0)
+        tooltip = (f"{r.get('title','')} | dur:{dur:.3f}s | "
+                   f"written:{fmt_bytes(dw)} | read:{fmt_bytes(dr)} | "
+                   f"strace:{r.get('strace_events',0)}")
+        svg.append(f'<text x="{pad_l-4}" y="{y+row_h-6}" text-anchor="end" '
+                   f'font-family="monospace" font-size="9" fill="#333">{html.escape(label)}</text>')
+        svg.append(f'<rect x="{x1:.1f}" y="{y+2}" width="{bw:.1f}" height="{row_h-4}" '
+                   f'fill="{col}" rx="2" opacity="0.85">'
+                   f'<title>{html.escape(tooltip)}</title></rect>')
+    # legend
+    legend_y = height - 40
+    legend_items = [
+        ('#aaa', 'none'),
+        ('rgb(74,144,217)', 'small (<1MB)'),
+        ('rgb(255,140,0)', 'medium (~10MB)'),
+        ('rgb(255,0,0)', 'large (>100MB)'),
+    ]
+    lx = pad_l
+    svg.append(f'<text x="{pad_l}" y="{legend_y-4}" font-family="monospace" font-size="10" fill="#555">I/O scale:</text>')
+    lx += 58
+    for col, label in legend_items:
+        svg.append(f'<rect x="{lx}" y="{legend_y-10}" width="14" height="10" fill="{col}" rx="2"/>')
+        svg.append(f'<text x="{lx+18}" y="{legend_y}" font-family="monospace" font-size="10" fill="#333">{html.escape(label)}</text>')
+        lx += len(label) * 7 + 30
+    svg.append('</svg>')
+    return '\n'.join(svg)
+
+def make_disk_io_chart(io_poll_points, io_resources, width=900, height=220):
+    """Plot read/write KB/s over time from proc-io-poll cumulative bytes."""
+    if len(io_poll_points) < 2:
+        return '<div class="chart-empty">No disk I/O poll data collected (proc-io-poll.log).</div>'
+    # compute deltas -> KB/s
+    rate_points = []  # [(elapsed_s, read_kbs, write_kbs)]
+    for i in range(1, len(io_poll_points)):
+        ts0, rb0, wb0 = io_poll_points[i-1]
+        ts1, rb1, wb1 = io_poll_points[i]
+        dt_s = (ts1 - ts0) / 1000.0
+        if dt_s <= 0:
+            continue
+        r_kbs = (rb1 - rb0) / dt_s / 1024.0
+        w_kbs = (wb1 - wb0) / dt_s / 1024.0
+        elapsed = (ts1 - io_poll_points[0][0]) / 1000.0
+        rate_points.append((elapsed, max(r_kbs, 0), max(w_kbs, 0)))
+    if not rate_points:
+        return '<div class="chart-empty">No disk I/O rate data.</div>'
+
+    pad_l, pad_r, pad_t, pad_b = 65, 20, 36, 36
+    pw = width - pad_l - pad_r
+    ph = height - pad_t - pad_b
+
+    ts_start_ms = io_poll_points[0][0]
+    ts_end_ms   = io_poll_points[-1][0]
+    elapsed_max = max((ts_end_ms - ts_start_ms) / 1000.0, 1.0)
+
+    all_kbs = [p[1] for p in rate_points] + [p[2] for p in rate_points]
+    max_kbs = max(all_kbs) if all_kbs else 1
+    if max_kbs == 0: max_kbs = 1
+
+    def tx(t):
+        return pad_l + t / elapsed_max * pw
+    def ty(v):
+        return height - pad_b - v / max_kbs * ph
+
+    svg = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
+           f'style="background:#fff;border:1px solid #e0e0e0;border-radius:4px;display:block">']
+    svg.append(f'<text x="{(pad_l+width-pad_r)//2}" y="20" text-anchor="middle" '
+               f'font-family="monospace" font-size="12" font-weight="bold">Disk I/O Rate (KB/s)</text>')
+    # axes
+    svg.append(f'<line x1="{pad_l}" y1="{pad_t}" x2="{pad_l}" y2="{height-pad_b}" stroke="#bbb" stroke-width="1"/>')
+    svg.append(f'<line x1="{pad_l}" y1="{height-pad_b}" x2="{width-pad_r}" y2="{height-pad_b}" stroke="#bbb" stroke-width="1"/>')
+    # y ticks
+    for frac in [0, 0.5, 1.0]:
+        v = frac * max_kbs
+        yy = ty(v)
+        svg.append(f'<line x1="{pad_l-4}" y1="{yy:.1f}" x2="{pad_l}" y2="{yy:.1f}" stroke="#888"/>')
+        svg.append(f'<text x="{pad_l-6}" y="{yy+4:.1f}" text-anchor="end" font-family="monospace" font-size="10">{v:.0f}</text>')
+    # x ticks
+    for frac in [0, 0.25, 0.5, 0.75, 1.0]:
+        xv = frac * elapsed_max
+        xx = tx(xv)
+        svg.append(f'<line x1="{xx:.1f}" y1="{height-pad_b}" x2="{xx:.1f}" y2="{height-pad_b+4}" stroke="#888"/>')
+        svg.append(f'<text x="{xx:.1f}" y="{height-pad_b+14}" text-anchor="middle" font-family="monospace" font-size="10">{xv:.0f}s</text>')
+    # resource eval bands (top 20 by duration)
+    band_res = sorted(
+        [r for r in io_resources if r.get('t_start') and r.get('t_end')],
+        key=lambda r: -r.get('duration_s', 0))[:20]
+    if band_res:
+        ref_t0 = band_res[0]['t_start'] if band_res else 0
+        # use first io_poll ts as reference
+        ref_ts0 = io_poll_points[0][0] / 1000.0
+        for r in band_res:
+            rx1 = tx(r['t_start'] - ref_ts0)
+            rx2 = tx(r['t_end'] - ref_ts0)
+            bw = max(rx2 - rx1, 1.5)
+            svg.append(f'<rect x="{rx1:.1f}" y="{pad_t}" width="{bw:.1f}" height="{ph}" '
+                       f'fill="rgba(74,144,217,0.08)" stroke="none">'
+                       f'<title>{html.escape(r.get("title",""))}</title></rect>')
+    # polylines
+    r_pts = ' '.join(f'{tx(p[0]):.1f},{ty(p[1]):.1f}' for p in rate_points)
+    w_pts = ' '.join(f'{tx(p[0]):.1f},{ty(p[2]):.1f}' for p in rate_points)
+    svg.append(f'<polyline points="{r_pts}" fill="none" stroke="#4a90d9" stroke-width="2" stroke-linejoin="round"/>')
+    svg.append(f'<polyline points="{w_pts}" fill="none" stroke="#e87b2a" stroke-width="2" stroke-linejoin="round"/>')
+    # y-axis label
+    mid_y = (pad_t + height - pad_b) // 2
+    svg.append(f'<text x="12" y="{mid_y}" text-anchor="middle" font-family="monospace" font-size="10" '
+               f'transform="rotate(-90,12,{mid_y})">KB/s</text>')
+    # legend
+    svg.append(f'<rect x="{width-pad_r-130}" y="{pad_t+4}" width="10" height="10" fill="#4a90d9"/>')
+    svg.append(f'<text x="{width-pad_r-116}" y="{pad_t+13}" font-family="monospace" font-size="10">read rate</text>')
+    svg.append(f'<rect x="{width-pad_r-130}" y="{pad_t+20}" width="10" height="10" fill="#e87b2a"/>')
+    svg.append(f'<text x="{width-pad_r-116}" y="{pad_t+29}" font-family="monospace" font-size="10">write rate</text>')
+    svg.append('</svg>')
+    return '\n'.join(svg)
+
+def make_net_connections_chart(net_blocks, io_resources, width=900, height=180):
+    """Step-line chart of TCP connection count over time."""
+    if not net_blocks:
+        return '<div class="chart-empty">No net-poll data captured.</div>'
+    if len(net_blocks) < 2:
+        return '<div class="chart-empty">Not enough net-poll samples.</div>'
+
+    pad_l, pad_r, pad_t, pad_b = 50, 20, 36, 36
+    pw = width - pad_l - pad_r
+    ph = height - pad_t - pad_b
+
+    ts_min = net_blocks[0][0]
+    ts_max = net_blocks[-1][0]
+    if ts_max == ts_min:
+        ts_max = ts_min + 1
+    max_cnt = max(b[1] for b in net_blocks)
+    if max_cnt == 0:
+        max_cnt = 1
+
+    def tx(t):
+        return pad_l + (t - ts_min) / (ts_max - ts_min) * pw
+    def ty(v):
+        return height - pad_b - v / max_cnt * ph
+
+    svg = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
+           f'style="background:#fff;border:1px solid #e0e0e0;border-radius:4px;display:block">']
+    svg.append(f'<text x="{(pad_l+width-pad_r)//2}" y="20" text-anchor="middle" '
+               f'font-family="monospace" font-size="12" font-weight="bold">'
+               f'Network Connections Over Time</text>')
+    # axes
+    svg.append(f'<line x1="{pad_l}" y1="{pad_t}" x2="{pad_l}" y2="{height-pad_b}" stroke="#bbb" stroke-width="1"/>')
+    svg.append(f'<line x1="{pad_l}" y1="{height-pad_b}" x2="{width-pad_r}" y2="{height-pad_b}" stroke="#bbb" stroke-width="1"/>')
+    # y ticks
+    for v in range(0, max_cnt + 1):
+        yy = ty(v)
+        svg.append(f'<line x1="{pad_l-4}" y1="{yy:.1f}" x2="{pad_l}" y2="{yy:.1f}" stroke="#888"/>')
+        svg.append(f'<text x="{pad_l-6}" y="{yy+4:.1f}" text-anchor="end" font-family="monospace" font-size="10">{v}</text>')
+    # x ticks
+    elapsed_total = ts_max - ts_min
+    for frac in [0, 0.25, 0.5, 0.75, 1.0]:
+        xv = ts_min + frac * elapsed_total
+        xx = tx(xv)
+        svg.append(f'<line x1="{xx:.1f}" y1="{height-pad_b}" x2="{xx:.1f}" y2="{height-pad_b+4}" stroke="#888"/>')
+        svg.append(f'<text x="{xx:.1f}" y="{height-pad_b+14}" text-anchor="middle" font-family="monospace" font-size="10">{frac*elapsed_total:.0f}s</text>')
+    # resource eval bands
+    band_res = sorted(
+        [r for r in io_resources if r.get('t_start') and r.get('t_end')],
+        key=lambda r: -r.get('duration_s', 0))[:20]
+    for r in band_res:
+        rx1 = tx(r['t_start'])
+        rx2 = tx(r['t_end'])
+        bw = max(rx2 - rx1, 1.5)
+        svg.append(f'<rect x="{rx1:.1f}" y="{pad_t}" width="{bw:.1f}" height="{ph}" '
+                   f'fill="rgba(74,144,217,0.08)" stroke="none"/>')
+    # step-line
+    step_pts = []
+    for i, (ts, cnt) in enumerate(net_blocks):
+        x = tx(ts)
+        y = ty(cnt)
+        step_pts.append(f'{x:.1f},{y:.1f}')
+        if i + 1 < len(net_blocks):
+            x_next = tx(net_blocks[i+1][0])
+            step_pts.append(f'{x_next:.1f},{y:.1f}')
+    svg.append(f'<polyline points="{" ".join(step_pts)}" fill="none" stroke="#27ae60" stroke-width="2.5"/>')
+    # dots
+    for ts, cnt in net_blocks:
+        svg.append(f'<circle cx="{tx(ts):.1f}" cy="{ty(cnt):.1f}" r="3" fill="#27ae60" opacity="0.8">'
+                   f'<title>{cnt} connections @ t={ts-ts_min}s</title></circle>')
+    svg.append(f'<text x="12" y="{(pad_t+height-pad_b)//2}" text-anchor="middle" font-family="monospace" font-size="10" '
+               f'transform="rotate(-90,12,{(pad_t+height-pad_b)//2})">connections</text>')
+    svg.append('</svg>')
+    return '\n'.join(svg)
+
+def make_memory_segments_chart(pmap_texts, width=700, height=260):
+    """Grouped bar chart of RSS by memory category from pmap -x output at 3 time points."""
+    import re as _re2
+    if not any(pmap_texts):
+        return '<div class="chart-empty">No pmap data available (pmap-start/mid/end.txt not found).</div>'
+
+    CATEGORIES = ['Heap', 'Stack', 'Shared libs', 'Files', 'Kernel', 'Other']
+    CAT_COLORS  = {'Heap':'#4a90d9','Stack':'#e87b2a','Shared libs':'#27ae60',
+                   'Files':'#9b59b6','Kernel':'#888','Other':'#aaa'}
+    LABELS = ['Start', 'Mid', 'End']
+
+    def categorize(mapping, addr):
+        m = mapping.strip()
+        if '[heap]' in m or (not m and addr):
+            return 'Heap'
+        if '[stack]' in m:
+            return 'Stack'
+        if '.so' in m or 'lib' in m.lower():
+            return 'Shared libs'
+        if m in ('[vvar]', '[vdso]', '[vsyscall]'):
+            return 'Kernel'
+        if m and m[0] == '/':
+            return 'Files'
+        if not m:
+            return 'Heap'  # anonymous mappings treated as heap
+        return 'Other'
+
+    snapshots = []
+    for txt in pmap_texts:
+        cats = {c: 0 for c in CATEGORIES}
+        for line in txt.splitlines():
+            line = line.strip()
+            # skip header/total lines
+            if not line or line.startswith('Address') or line.startswith('----') or line.startswith('total'):
+                continue
+            parts = line.split(None, 5)
+            if len(parts) < 3:
+                continue
+            try:
+                rss = int(parts[2])
+            except ValueError:
+                continue
+            mapping = parts[5] if len(parts) > 5 else ''
+            addr = parts[0]
+            cat = categorize(mapping, addr)
+            cats[cat] += rss
+        snapshots.append(cats)
+
+    if not snapshots:
+        return '<div class="chart-empty">Could not parse pmap data.</div>'
+
+    max_rss = max((sum(s.values()) for s in snapshots), default=1)
+    if max_rss == 0:
+        max_rss = 1
+
+    n_snaps = len(snapshots)
+    n_cats  = len(CATEGORIES)
+    pad_l, pad_r, pad_t, pad_b = 70, 20, 40, 80
+    pw = width - pad_l - pad_r
+    ph = height - pad_t - pad_b
+
+    group_w = pw / n_snaps
+    bar_w   = group_w / (n_cats + 1)
+
+    def ty(v):
+        return height - pad_b - (v / max_rss) * ph
+
+    svg = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
+           f'style="background:#fff;border:1px solid #e0e0e0;border-radius:4px;display:block">']
+    svg.append(f'<text x="{(pad_l+width-pad_r)//2}" y="20" text-anchor="middle" '
+               f'font-family="monospace" font-size="12" font-weight="bold">Memory Segments by Category (pmap)</text>')
+    svg.append(f'<text x="{(pad_l+width-pad_r)//2}" y="33" text-anchor="middle" '
+               f'font-family="monospace" font-size="10" fill="#666">RSS KB by segment type at start / mid / end</text>')
+    # axes
+    svg.append(f'<line x1="{pad_l}" y1="{pad_t}" x2="{pad_l}" y2="{height-pad_b}" stroke="#bbb" stroke-width="1"/>')
+    svg.append(f'<line x1="{pad_l}" y1="{height-pad_b}" x2="{width-pad_r}" y2="{height-pad_b}" stroke="#bbb" stroke-width="1"/>')
+    # y ticks
+    for frac in [0, 0.5, 1.0]:
+        v = int(frac * max_rss)
+        yy = ty(v)
+        svg.append(f'<line x1="{pad_l-4}" y1="{yy:.1f}" x2="{pad_l}" y2="{yy:.1f}" stroke="#888"/>')
+        svg.append(f'<text x="{pad_l-6}" y="{yy+4:.1f}" text-anchor="end" font-family="monospace" font-size="10">{v//1024}MB</text>')
+    # bars
+    for si, snap in enumerate(snapshots):
+        gx = pad_l + si * group_w + bar_w * 0.5
+        for ci, cat in enumerate(CATEGORIES):
+            v = snap.get(cat, 0)
+            if v == 0:
+                continue
+            bx = gx + ci * bar_w
+            bh = (v / max_rss) * ph
+            by = height - pad_b - bh
+            svg.append(f'<rect x="{bx:.1f}" y="{by:.1f}" width="{bar_w-1:.1f}" height="{bh:.1f}" '
+                       f'fill="{CAT_COLORS[cat]}" rx="2" opacity="0.85">'
+                       f'<title>{cat}: {v//1024}MB ({LABELS[si]})</title></rect>')
+        # group label
+        lx = gx + group_w / 2 - bar_w * 0.5
+        svg.append(f'<text x="{lx:.1f}" y="{height-pad_b+14}" text-anchor="middle" '
+                   f'font-family="monospace" font-size="11" font-weight="bold">{LABELS[si]}</text>')
+    # legend
+    legend_y = height - 24
+    lx = pad_l
+    for cat in CATEGORIES:
+        svg.append(f'<rect x="{lx}" y="{legend_y-10}" width="10" height="10" fill="{CAT_COLORS[cat]}" rx="2"/>')
+        svg.append(f'<text x="{lx+13}" y="{legend_y}" font-family="monospace" font-size="9" fill="#333">{cat}</text>')
+        lx += len(cat) * 6.5 + 18
+    svg.append(f'<text x="12" y="{(pad_t+height-pad_b)//2}" text-anchor="middle" font-family="monospace" font-size="10" '
+               f'transform="rotate(-90,12,{(pad_t+height-pad_b)//2})">RSS KB</text>')
+    svg.append('</svg>')
+    return '\n'.join(svg)
+
 def make_memory_chart(mem_points_ts, io_resources, width=900, height=300):
     """Enhanced memory chart: RSS over time with per-resource eval bands and min/max/peak lines.
     mem_points_ts: [(unix_ts, rss_kb)]; io_resources: correlated list with t_start/t_end."""
@@ -2692,8 +3733,8 @@ import html as _html_mod
 def _sanitize_svg(s):
     import re as _re
     # Remove <script> blocks including self-closing/unclosed variants
-    s = _re.sub(r'<script\b[^>]*>.*?</script>', '', s, flags=_re.DOTALL|_re.IGNORECASE)
-    s = _re.sub(r'<script\b[^>]*/?\s*>', '', s, flags=_re.IGNORECASE)
+    s = _re.sub(r'<(?:\w+:)?script\b[^>]*>.*?</(?:\w+:)?script>', '', s, flags=_re.DOTALL|_re.IGNORECASE)
+    s = _re.sub(r'<(?:\w+:)?script\b[^>]*/?\s*>', '', s, flags=_re.IGNORECASE)
     # Remove animate/set elements that can animate href to javascript: URIs
     s = _re.sub(r'<(?:animate|set)\b[^>]*/?\s*>', '', s, flags=_re.IGNORECASE)
     s = _re.sub(r'<(?:animate|set)\b.*?</(?:animate|set)>', '', s, flags=_re.DOTALL|_re.IGNORECASE)
@@ -2727,6 +3768,14 @@ def _sanitize_svg(s):
                        m.group(0), flags=_re.IGNORECASE)
     s = _re.sub(r'style\s*=\s*"[^"]*"', _clean_style_url, s, flags=_re.IGNORECASE)
     s = _re.sub(r"style\s*=\s*'[^']*'", _clean_style_url, s, flags=_re.IGNORECASE)
+    # Also catch unquoted style= values: style=fill:url(javascript:...)
+    s = _re.sub(r'style\s*=\s*([^\s>"\']\S*)', _clean_style_url, s, flags=_re.IGNORECASE)
+    # Sanitize url() in <style> blocks — same allowlist as inline style= attributes
+    def _clean_style_block(m):
+        return _re.sub(r'url\s*\(([^)]*)\)',
+                       lambda u: u.group(0) if u.group(1).strip().startswith('#') else 'url(#)',
+                       m.group(0), flags=_re.IGNORECASE)
+    s = _re.sub(r'<style\b[^>]*>.*?</style>', _clean_style_block, s, flags=_re.DOTALL|_re.IGNORECASE)
     return s
 
 flamegraph_section = ''
@@ -2734,7 +3783,21 @@ if os.path.isfile(flamegraph_svg) and os.path.getsize(flamegraph_svg) > 0:
     with open(flamegraph_svg) as f:
         svg_content = f.read()
     svg_content = _sanitize_svg(svg_content)
-    flamegraph_section = f'<section id="flamegraph"><h2>Flamegraph / Stack Summary</h2><div class="flamegraph-wrap">{svg_content}</div></section>'
+    flamegraph_section = (
+        f'<section id="flamegraph"><h2>Flamegraph / Stack Summary</h2>'
+        f'<div style="margin-bottom:6px">'
+        f'<input id="flamegraph-search" type="text" placeholder="Search frames..." '
+        f'oninput="flamegraphSearch(\'flamegraph\',this.value)" '
+        f'style="padding:4px 8px;font-family:monospace;font-size:12px;width:250px">'
+        f'<span id="flamegraph-search-info" style="font-family:monospace;font-size:12px;color:#4a90d9;margin-left:8px"></span>'
+        f'<button onclick="flamegraphSearch(\'flamegraph\',\'\');document.getElementById(\'flamegraph-search\').value=\'\'" '
+        f'style="margin-left:8px;padding:3px 8px;font-size:12px">Clear</button>'
+        f'<button onclick="flamegraphResetZoom(\'flamegraph\')" '
+        f'style="margin-left:4px;padding:3px 8px;font-size:12px">Reset Zoom</button>'
+        f'<span style="margin-left:16px;font-family:monospace;font-size:12px;color:#888">scroll to zoom</span>'
+        f'</div>'
+        f'<div class="flamegraph-wrap">{svg_content}</div></section>'
+    )
 else:
     flamegraph_section = '<section id="flamegraph"><h2>Flamegraph / Stack Summary</h2><div class="chart-empty">Not available (requires perf + flamegraph.pl as root, or /proc/PID/stack samples).</div></section>'
 
@@ -2743,7 +3806,22 @@ if profile_flamegraph_svg and os.path.isfile(profile_flamegraph_svg) and os.path
     with open(profile_flamegraph_svg) as f:
         profile_svg_content = f.read()
     profile_svg_content = _sanitize_svg(profile_svg_content)
-    profile_flamegraph_section = f'<section id="profile-flamegraph"><h2>Profile Flamegraph (Catalog Compilation)</h2><p style="font-size:0.85em;color:#666;margin-bottom:8px;">Generated from puppetserver PROFILE log entries via puppet-profile-parser + flamegraph.pl. Click to zoom.</p><div class="flamegraph-wrap">{profile_svg_content}</div></section>'
+    profile_flamegraph_section = (
+        f'<section id="profile-flamegraph"><h2>Profile Flamegraph (Catalog Compilation)</h2>'
+        f'<p style="font-size:0.85em;color:#666;margin-bottom:8px;">Generated from puppetserver PROFILE log entries via puppet-profile-parser + flamegraph.pl. Click to zoom.</p>'
+        f'<div style="margin-bottom:6px">'
+        f'<input id="profile-flamegraph-search" type="text" placeholder="Search frames..." '
+        f'oninput="flamegraphSearch(\'profile-flamegraph\',this.value)" '
+        f'style="padding:4px 8px;font-family:monospace;font-size:12px;width:250px">'
+        f'<span id="profile-flamegraph-search-info" style="font-family:monospace;font-size:12px;color:#4a90d9;margin-left:8px"></span>'
+        f'<button onclick="flamegraphSearch(\'profile-flamegraph\',\'\');document.getElementById(\'profile-flamegraph-search\').value=\'\'" '
+        f'style="margin-left:8px;padding:3px 8px;font-size:12px">Clear</button>'
+        f'<button onclick="flamegraphResetZoom(\'profile-flamegraph\')" '
+        f'style="margin-left:4px;padding:3px 8px;font-size:12px">Reset Zoom</button>'
+        f'<span style="margin-left:16px;font-family:monospace;font-size:12px;color:#888">scroll to zoom</span>'
+        f'</div>'
+        f'<div class="flamegraph-wrap">{profile_svg_content}</div></section>'
+    )
 else:
     profile_html_fallback = profile_flamegraph_svg.replace('.svg', '.html') if profile_flamegraph_svg else ''
     fallback_msg = 'Not available — no PROFILE entries captured. Ensure puppetserver is reachable via SSH and received the --profile flag.'
@@ -2752,10 +3830,107 @@ else:
             fallback_msg = _html_mod.escape(f.read())
     profile_flamegraph_section = f'<section id="profile-flamegraph"><h2>Profile Flamegraph (Catalog Compilation)</h2><div class="chart-empty">{fallback_msg}</div></section>'
 
+# Feature 5: rbspy Ruby-level flamegraph section
+rbspy_flamegraph_section = ''
+if os.path.isfile(rbspy_svg_path) and os.path.getsize(rbspy_svg_path) > 0:
+    with open(rbspy_svg_path) as f:
+        rbspy_svg_content = f.read()
+    rbspy_svg_content = _sanitize_svg(rbspy_svg_content)
+    rbspy_flamegraph_section = (
+        f'<section id="rbspy-flamegraph"><h2>Ruby-level Flamegraph (rbspy)</h2>'
+        f'<p style="font-size:0.85em;color:#666;margin-bottom:8px;">Generated by rbspy sampling the puppet Ruby process. Shows time spent in Ruby methods.</p>'
+        f'<div style="margin-bottom:6px">'
+        f'<input id="rbspy-flamegraph-search" type="text" placeholder="Search frames..." '
+        f'oninput="flamegraphSearch(\'rbspy-flamegraph\',this.value)" '
+        f'style="padding:4px 8px;font-family:monospace;font-size:12px;width:250px">'
+        f'<span id="rbspy-flamegraph-search-info" style="font-family:monospace;font-size:12px;color:#4a90d9;margin-left:8px"></span>'
+        f'<button onclick="flamegraphSearch(\'rbspy-flamegraph\',\'\');document.getElementById(\'rbspy-flamegraph-search\').value=\'\'" '
+        f'style="margin-left:8px;padding:3px 8px;font-size:12px">Clear</button>'
+        f'<button onclick="flamegraphResetZoom(\'rbspy-flamegraph\')" '
+        f'style="margin-left:4px;padding:3px 8px;font-size:12px">Reset Zoom</button>'
+        f'</div>'
+        f'<div class="flamegraph-wrap">{rbspy_svg_content}</div></section>'
+    )
+else:
+    rbspy_flamegraph_section = '<section id="rbspy-flamegraph"><h2>Ruby-level Flamegraph (rbspy)</h2><div class="chart-empty">Not available (rbspy not installed or not root).</div></section>'
+
+# Feature 8: HTTP phase waterfall chart
+def make_http_phase_waterfall(http_phases, width=900, height=180):
+    """Horizontal bar waterfall of HTTP phases in the puppet run."""
+    if not http_phases:
+        return '<div class="chart-empty">No HTTP phases detected in strace (requires strace + root + puppet agent mode).</div>'
+    PHASE_COLORS = {
+        'node_classify':   '#4a90d9',
+        'facts_upload':    '#27ae60',
+        'catalog_request': '#e87b2a',
+        'file_resource':   '#9b59b6',
+        'report_submit':   '#e84040',
+        'other_http':      '#888',
+    }
+    # Build timeline: group by phase, show each occurrence
+    if not http_phases:
+        return '<div class="chart-empty">No HTTP phases.</div>'
+    ts_min = min(p['ts'] for p in http_phases)
+    ts_max = max(p['ts'] for p in http_phases) + 0.5
+    if ts_max <= ts_min:
+        ts_max = ts_min + 1
+
+    pad_l, pad_r, pad_t, pad_b = 140, 20, 36, 40
+    pw = width - pad_l - pad_r
+    row_h = 22
+
+    # group phases by name
+    import collections as _col
+    by_phase = _col.defaultdict(list)
+    for p in http_phases:
+        by_phase[p['phase']].append(p)
+
+    phase_order = ['node_classify','facts_upload','catalog_request','file_resource','report_submit','other_http']
+    rows = [(ph, by_phase[ph]) for ph in phase_order if ph in by_phase]
+    n_rows = len(rows)
+    svg_h = pad_t + n_rows * row_h + pad_b
+
+    def tx(t):
+        return pad_l + (t - ts_min) / (ts_max - ts_min) * pw
+
+    svg = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{svg_h}" '
+           f'style="background:#fff;border:1px solid #e0e0e0;border-radius:4px;display:block">']
+    svg.append(f'<text x="{(pad_l+width-pad_r)//2}" y="20" text-anchor="middle" '
+               f'font-family="monospace" font-size="12" font-weight="bold">HTTP Phase Waterfall</text>')
+    svg.append(f'<line x1="{pad_l}" y1="{pad_t}" x2="{pad_l}" y2="{svg_h-pad_b}" stroke="#bbb" stroke-width="1"/>')
+    svg.append(f'<line x1="{pad_l}" y1="{svg_h-pad_b}" x2="{width-pad_r}" y2="{svg_h-pad_b}" stroke="#bbb" stroke-width="1"/>')
+
+    for i, (phase, events) in enumerate(rows):
+        y = pad_t + i * row_h
+        col = PHASE_COLORS.get(phase, '#888')
+        svg.append(f'<text x="{pad_l-4}" y="{y+row_h-6}" text-anchor="end" '
+                   f'font-family="monospace" font-size="10" fill="#333">{html.escape(phase.replace("_"," "))}</text>')
+        for ev in events:
+            x = tx(ev['ts'])
+            svg.append(f'<rect x="{x:.1f}" y="{y+3}" width="6" height="{row_h-8}" '
+                       f'fill="{col}" rx="2" opacity="0.85">'
+                       f'<title>{html.escape(phase)}: {ev["verb"]} {html.escape(ev["path"])} @ t={ev["ts"]:.2f}s</title></rect>')
+
+    # x-axis ticks
+    elapsed_total = ts_max - ts_min
+    for frac in [0, 0.25, 0.5, 0.75, 1.0]:
+        xv = ts_min + frac * elapsed_total
+        xx = tx(xv)
+        svg.append(f'<line x1="{xx:.1f}" y1="{svg_h-pad_b}" x2="{xx:.1f}" y2="{svg_h-pad_b+4}" stroke="#888"/>')
+        svg.append(f'<text x="{xx:.1f}" y="{svg_h-pad_b+14}" text-anchor="middle" font-family="monospace" font-size="10">{frac*elapsed_total:.0f}s</text>')
+    svg.append('</svg>')
+    return '\n'.join(svg)
+
+http_phase_chart = make_http_phase_waterfall(http_phases)
+
 puppet_log_html = html.escape(''.join(puppet_lines)) if puppet_lines else '(empty)'
-timing_chart = make_bar_chart(step_list, wall_seconds)
-mem_chart    = make_memory_chart(mem_points_ts, io_resources, width=900, height=300)
-cpu_chart    = make_line_chart(cpu_points, 'CPU% over time', 'CPU%', '#e84040')
+timing_chart          = make_bar_chart(step_list, wall_seconds)
+mem_chart             = make_memory_chart(mem_points_ts, io_resources, width=900, height=300)
+cpu_chart             = make_line_chart(cpu_points, 'CPU% over time', 'CPU%', '#e84040')
+resource_timeline     = make_resource_timeline(io_resources, width=1000)
+disk_io_chart         = make_disk_io_chart(io_poll_points, io_resources, width=900, height=220)
+net_connections_chart = make_net_connections_chart(net_blocks, io_resources, width=900, height=180)
+memory_segments_chart = make_memory_segments_chart(pmap_texts, width=700, height=260)
 
 latency_rows = ''
 prev_dur = 0.0
@@ -2819,9 +3994,12 @@ for i, r in enumerate(display_resources):
     rss_delta = r.get('rss_delta')
     rss_peak  = r.get('rss_peak')
     rss_start = r.get('rss_start')
-    params  = r.get('parameters') or {}
-    src_file = r.get('file') or ''
-    src_line = r.get('line') or ''
+    params     = r.get('parameters') or {}
+    src_file   = r.get('file') or ''
+    src_line   = r.get('line') or ''
+    pdb_source = r.get('pdb_source', False)
+    before_val = r.get('before')
+    after_val  = r.get('after')
 
     proc_str = ', '.join(
         html.escape(os.path.basename(p.get('exe', f"pid:{p.get('pid','?')}")))
@@ -2875,10 +4053,25 @@ for i, r in enumerate(display_resources):
 
     src_info = ''
     if src_file:
+        pdb_tag = ' <span style="background:#8e44ad;color:#fff;padding:1px 6px;border-radius:3px;font-size:0.75em;vertical-align:middle">PuppetDB</span>' if pdb_source else ''
         src_info = f'<p style="margin-top:4px;font-size:0.85em;color:#555">Source: <code>{html.escape(src_file)}</code>'
         if src_line:
             src_info += f':<code>{html.escape(str(src_line))}</code>'
-        src_info += '</p>'
+        src_info += pdb_tag + '</p>'
+    elif pdb_source:
+        src_info = '<p style="margin-top:4px;font-size:0.85em;color:#555"><span style="background:#8e44ad;color:#fff;padding:1px 6px;border-radius:3px;font-size:0.75em">PuppetDB</span> resource (no manifest source recorded)</p>'
+
+    before_after_html = ''
+    if before_val is not None or after_val is not None:
+        b_str = html.escape(str(before_val)) if before_val is not None else '<em style="color:#888">—</em>'
+        a_str = html.escape(str(after_val))  if after_val  is not None else '<em style="color:#888">—</em>'
+        before_after_html = f'''<div style="margin-bottom:8px">
+    <b>Change:</b>
+    <table style="width:100%;margin-top:4px;font-family:monospace;font-size:12px">
+      <tr><th style="width:50%">Before</th><th style="width:50%">After</th></tr>
+      <tr><td style="background:#fff0f0;padding:4px 8px">{b_str}</td>
+          <td style="background:#f0fff0;padding:4px 8px">{a_str}</td></tr>
+    </table></div>'''
 
     rss_mem_info = ''
     if rss_start is not None:
@@ -2891,6 +4084,7 @@ for i, r in enumerate(display_resources):
 <tr id="{rid}-detail" style="display:none">
   <td colspan="10" style="background:#f8f9fb;padding:12px">
     {src_info}
+    {before_after_html}
     {rss_mem_info}
     <b>Parameters ({len(params)}):</b>
     <table style="width:100%;margin-bottom:8px;margin-top:4px">
@@ -2916,8 +4110,9 @@ for i, r in enumerate(display_resources):
   </td>
 </tr>'''
 
+    pdb_badge = ' <span style="background:#8e44ad;color:#fff;padding:1px 5px;border-radius:3px;font-size:0.7em;vertical-align:middle" title="Resource data from PuppetDB">PDB</span>' if pdb_source else ''
     resource_table_rows += f'''<tr onclick="toggleDetail('{rid}')" style="cursor:pointer">
-  <td>{title}</td>
+  <td>{title}{pdb_badge}</td>
   <td>{rtype}</td>
   <td>{status_badge(status)}</td>
   <td>{dur:.3f}s</td>
@@ -3006,6 +4201,70 @@ function sortTable(n) {{
     if (det) tbody.appendChild(det);
   }});
 }}
+
+// Flamegraph zoom + search
+function initFlamegraph(sectionId) {{
+  var section = document.getElementById(sectionId);
+  if (!section) return;
+  var svg = section.querySelector('svg');
+  if (!svg) return;
+  var origFills = new Map();
+  var groups = Array.from(svg.querySelectorAll('#frames > g, #frames g > g, g[id] > g'));
+  groups.forEach(function(g) {{
+    var rect = g.querySelector('rect');
+    if (rect) origFills.set(rect, rect.getAttribute('fill'));
+    g.style.cursor = 'pointer';
+  }});
+  section._origFills = origFills;
+  section._svgGroups = groups;
+  section._fgScale = 1;
+  var wrap = section.querySelector('.flamegraph-wrap');
+  if (wrap) {{
+    wrap.addEventListener('wheel', function(e) {{
+      e.preventDefault();
+      section._fgScale = Math.max(0.5, Math.min(8, section._fgScale * (e.deltaY < 0 ? 1.15 : 0.87)));
+      svg.style.transform = 'scale(' + section._fgScale + ')';
+      svg.style.transformOrigin = 'top left';
+    }}, {{passive: false}});
+  }}
+}}
+
+function flamegraphResetZoom(sectionId) {{
+  var section = document.getElementById(sectionId);
+  if (!section) return;
+  var svg = section.querySelector('svg');
+  if (!svg) return;
+  section._fgScale = 1;
+  svg.style.transform = 'scale(1)';
+}}
+
+function flamegraphSearch(sectionId, term) {{
+  var section = document.getElementById(sectionId);
+  if (!section) return;
+  var lterm = term.toLowerCase();
+  var matched = 0;
+  if (!section._svgGroups) return;
+  section._svgGroups.forEach(function(g) {{
+    var rect = g.querySelector('rect');
+    var title = g.querySelector('title');
+    if (!rect) return;
+    if (!term) {{
+      rect.setAttribute('fill', section._origFills.get(rect) || rect.getAttribute('fill'));
+      return;
+    }}
+    var match = title && title.textContent.toLowerCase().includes(lterm);
+    if (match) {{ matched++; rect.setAttribute('fill', '#ff8c00'); }}
+    else rect.setAttribute('fill', section._origFills.get(rect) || '#ccc');
+  }});
+  var info = document.getElementById(sectionId + '-search-info');
+  if (info) info.textContent = term ? matched + ' matched' : '';
+}}
+
+window.addEventListener('load', function() {{
+  initFlamegraph('flamegraph');
+  initFlamegraph('profile-flamegraph');
+  initFlamegraph('rbspy-flamegraph');
+}});
 </script>
 </head>
 <body>
@@ -3039,6 +4298,7 @@ function sortTable(n) {{
     <div class="stat-card"><div class="value">{res_failed}</div><div class="label">Resources failed</div></div>
     <div class="stat-card"><div class="value">{res_skipped}</div><div class="label">Resources skipped</div></div>
     <div class="stat-card"><div class="value">{res_total}</div><div class="label">Resources total</div></div>
+    {'<div class="stat-card" style="border-color:#8e44ad"><div class="value" style="color:#8e44ad">✓</div><div class="label">PuppetDB enriched</div></div>' if rr_pdb_enriched else '<div class="stat-card" style="opacity:0.4"><div class="value">—</div><div class="label">PuppetDB</div></div>'}
     <div class="stat-card"><div class="value">{fmt_bytes(total_disk_written)}</div><div class="label">Total disk written</div></div>
     <div class="stat-card"><div class="value">{strace_total_events:,}</div><div class="label">strace events</div></div>
     <div class="stat-card"><div class="value" style="color:{idem_color}">{idem_label}</div><div class="label">Idempotency</div></div>
@@ -3057,6 +4317,21 @@ function sortTable(n) {{
   {mem_chart}
 </section>
 
+<section id="memory-segments">
+  <h2>Memory Segments (pmap)</h2>
+  {memory_segments_chart}
+</section>
+
+<section id="disk-io">
+  <h2>Disk I/O Rate</h2>
+  {disk_io_chart}
+</section>
+
+<section id="net-io">
+  <h2>Network Connections Over Time</h2>
+  {net_connections_chart}
+</section>
+
 <section id="cpu">
   <h2>CPU%</h2>
   {cpu_chart}
@@ -3065,6 +4340,21 @@ function sortTable(n) {{
 {flamegraph_section}
 
 {profile_flamegraph_section}
+
+{rbspy_flamegraph_section}
+
+<section id="http-phases">
+  <h2>HTTP Phase Waterfall</h2>
+  {http_phase_chart}
+</section>
+
+{'<section id="facter-gap"><h2>Facter / Pre-Catalog Gap</h2><p style="font-family:monospace;font-size:13px">Pre-catalog gap (facter + agent init): <b>' + str(facter_gap_secs) + 's</b></p>' + ('<details><summary>Facter --timing output</summary><pre>' + html.escape(facter_timing_text) + '</pre></details>' if facter_timing_text else '') + '</section>' if facter_gap_secs is not None else ''}
+
+{'<section id="gc-profiler"><h2>GC::Profiler (Ruby GC)</h2><pre>' + html.escape(gc_profiler_text) + '</pre></section>' if gc_profiler_text else ''}
+
+{'<section id="cgroup"><h2>cgroup v2 Accounting</h2><pre>' + html.escape(cgroup_log_text) + '</pre></section>' if cgroup_log_text else ''}
+
+{'<section id="state-yaml"><h2>state.yaml Health</h2><p style="font-family:monospace;font-size:13px">state.yaml size: <b style="color:#e84040">' + str(state_yaml_size // 1024 // 1024) + 'MB (' + str(state_yaml_size // 1024) + 'KB)</b> — <span style="color:#e84040;font-weight:bold">WARNING: PUP-3647 bloat suspected. Large state file adds minutes to run time.</span></p></section>' if state_yaml_size > 10485760 else ('<section id="state-yaml"><h2>state.yaml Health</h2><p style="font-family:monospace;font-size:13px">state.yaml size: <b>' + str(state_yaml_size // 1024) + 'KB</b> (OK)</p></section>' if state_yaml_size > 0 else '')}
 
 <section id="latency">
   <h2>Step Latency</h2>
@@ -3092,7 +4382,7 @@ function sortTable(n) {{
 
 <section id="resources">
   <h2>Per-Resource I/O Attribution</h2>
-  {'<p style="color:#888;font-size:0.85em">strace correlation active — click row to expand file/process/network detail. Sorted by disk written.</p>' if io_resources else '<p style="color:#888;font-style:italic">strace correlation not available (requires root + strace). Showing resources from last_run_report.yaml without I/O attribution.</p>'}
+  {'<p style="color:#888;font-size:0.85em">strace correlation active — click row to expand file/process/network detail. Sorted by disk written.' + (' &nbsp;<span style="background:#8e44ad;color:#fff;padding:1px 6px;border-radius:3px;font-size:0.8em">PuppetDB</span> parameters/before/after enriched from PuppetDB (' + html.escape(rr_pdb_node) + ').' if rr_pdb_enriched else '') + '</p>' if io_resources else '<p style="color:#888;font-style:italic">strace correlation not available (requires root + strace). Showing resources from ' + ('PuppetDB (' + html.escape(rr_pdb_node) + ')' if rr_pdb_enriched else 'last_run_report.yaml') + ' without I/O attribution.</p>'}
   <table id="res-table" data-sort-dir="desc">
     <thead>
       <tr>
@@ -3112,6 +4402,11 @@ function sortTable(n) {{
       {resource_table_rows if resource_table_rows else '<tr><td colspan="10" style="color:#888;font-style:italic">No resource data available</td></tr>'}
     </tbody>
   </table>
+</section>
+
+<section id="timeline">
+  <h2>Resource I/O Timeline</h2>
+  {resource_timeline}
 </section>
 
 <section id="idempotency">
@@ -3150,12 +4445,300 @@ function sortTable(n) {{
 </html>
 '''
 
-import os as _os; _old_umask = _os.umask(0o077)
+import os as _os; _old_umask = _os.umask(0o022)
 with open(report_html, 'w') as f:
     f.write(HTML)
 _os.umask(_old_umask)
 print(f"Report written: {report_html}")
 PYEOF
+}
+
+###############################################################################
+# SUBCOMMAND: diff — compare two run outdirs
+###############################################################################
+cmd_diff() {
+    local dir1="" dir2="" outfile="" format="text"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --help|-h) echo "Usage: puppet-trace diff DIR1 DIR2 [--out FILE] [--html]"; exit 0 ;;
+            --out)    outfile="$2"; shift 2 ;;
+            --html)   format="html"; shift ;;
+            *)
+                if [[ -z "$dir1" ]]; then dir1="$1"
+                elif [[ -z "$dir2" ]]; then dir2="$1"
+                else echo "[puppet-trace diff] unexpected arg: $1" >&2; exit 1
+                fi
+                shift ;;
+        esac
+    done
+    if [[ -z "$dir1" ]] || [[ -z "$dir2" ]]; then
+        echo "Usage: puppet-trace diff DIR1 DIR2 [--out FILE] [--html]" >&2
+        exit 1
+    fi
+    _validate_safe_path "$dir1" "DIR1" || exit 1
+    _validate_safe_path "$dir2" "DIR2" || exit 1
+    [[ -d "$dir1" ]] || { echo "[puppet-trace diff] DIR1 not found: $dir1" >&2; exit 1; }
+    [[ -d "$dir2" ]] || { echo "[puppet-trace diff] DIR2 not found: $dir2" >&2; exit 1; }
+
+    python3 - "$dir1" "$dir2" "$format" "${outfile:-}" <<'DIFF_PYEOF'
+import json, os, sys, html as _html
+
+dir1, dir2, fmt, outfile = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+
+def load_resources(d):
+    p = os.path.join(d, 'resource-report.json')
+    if not os.path.exists(p):
+        return {}
+    try:
+        data = json.load(open(p))
+        return {r['title']: r for r in data.get('resources', data if isinstance(data, list) else [])}
+    except Exception as e:
+        print(f'Warning: could not load {p}: {e}', file=sys.stderr)
+        return {}
+
+def load_meta(d):
+    p = os.path.join(d, 'run-meta.json')
+    if os.path.exists(p):
+        try:
+            return json.load(open(p))
+        except Exception:
+            pass
+    return {}
+
+res1 = load_resources(dir1)
+res2 = load_resources(dir2)
+meta1 = load_meta(dir1)
+meta2 = load_meta(dir2)
+
+all_titles = sorted(set(list(res1.keys()) + list(res2.keys())))
+
+added = [t for t in all_titles if t not in res1]
+removed = [t for t in all_titles if t not in res2]
+common = [t for t in all_titles if t in res1 and t in res2]
+
+def dur(r):
+    return float(r.get('duration', r.get('eval_time', r.get('evaluation_time', 0))) or 0)
+
+regressions = []
+improvements = []
+for t in common:
+    d1, d2 = dur(res1[t]), dur(res2[t])
+    if d2 > d1 * 1.2 and d2 - d1 > 0.5:  # 20% slower AND >0.5s worse
+        regressions.append((t, d1, d2, d2 - d1))
+    elif d1 > d2 * 1.2 and d1 - d2 > 0.5:
+        improvements.append((t, d1, d2, d1 - d2))
+
+regressions.sort(key=lambda x: -x[3])
+improvements.sort(key=lambda x: -x[3])
+
+wall1 = meta1.get('wall_seconds', '?')
+wall2 = meta2.get('wall_seconds', '?')
+
+if fmt == 'text':
+    lines = []
+    lines.append(f'puppet-trace diff: {os.path.basename(dir1)} -> {os.path.basename(dir2)}')
+    lines.append(f'Wall time: {wall1}s -> {wall2}s')
+    if isinstance(wall1, int) and isinstance(wall2, int):
+        delta = wall2 - wall1
+        lines.append(f'  Delta: {"+" if delta >= 0 else ""}{delta}s ({100*(wall2-wall1)//max(wall1,1):+d}%)')
+    lines.append(f'\nResources: {len(res1)} -> {len(res2)} ({len(added)} added, {len(removed)} removed)')
+    if regressions:
+        lines.append(f'\nREGRESSIONS ({len(regressions)}):')
+        for t, d1, d2, delta in regressions[:20]:
+            lines.append(f'  {t:60s}  {d1:.2f}s -> {d2:.2f}s  (+{delta:.2f}s)')
+    if improvements:
+        lines.append(f'\nIMPROVEMENTS ({len(improvements)}):')
+        for t, d1, d2, delta in improvements[:20]:
+            lines.append(f'  {t:60s}  {d1:.2f}s -> {d2:.2f}s  (-{delta:.2f}s)')
+    if added:
+        lines.append(f'\nADDED RESOURCES ({len(added)}):')
+        for t in added[:20]:
+            lines.append(f'  + {t}')
+    if removed:
+        lines.append(f'\nREMOVED RESOURCES ({len(removed)}):')
+        for t in removed[:20]:
+            lines.append(f'  - {t}')
+    output = '\n'.join(lines)
+    if outfile:
+        open(outfile, 'w').write(output + '\n')
+        print(f'[puppet-trace diff] written to {outfile}')
+    else:
+        print(output)
+
+elif fmt == 'html':
+    def esc(s): return _html.escape(str(s))
+    rows = []
+    for t, d1, d2, delta in regressions[:50]:
+        pct = int(100*(d2-d1)/max(d1,0.001))
+        rows.append(f'<tr class="reg"><td>{esc(t)}</td><td>{d1:.2f}s</td><td>{d2:.2f}s</td><td>+{delta:.2f}s (+{pct}%)</td></tr>')
+    for t, d1, d2, delta in improvements[:50]:
+        pct = int(100*(d1-d2)/max(d1,0.001))
+        rows.append(f'<tr class="imp"><td>{esc(t)}</td><td>{d1:.2f}s</td><td>{d2:.2f}s</td><td>-{delta:.2f}s (-{pct}%)</td></tr>')
+    for t in added[:50]:
+        rows.append(f'<tr class="add"><td>{esc(t)}</td><td>-</td><td>{dur(res2[t]):.2f}s</td><td>new</td></tr>')
+    for t in removed[:50]:
+        rows.append(f'<tr class="rem"><td>{esc(t)}</td><td>{dur(res1[t]):.2f}s</td><td>-</td><td>removed</td></tr>')
+
+    wall_delta = ''
+    if isinstance(wall1, int) and isinstance(wall2, int):
+        d = wall2 - wall1
+        wall_delta = f' ({d:+d}s)'
+
+    page = f"""<!DOCTYPE html>
+<html><head><meta charset=utf-8><title>puppet-trace diff</title>
+<style>
+body{{font-family:monospace;background:#1a1a2e;color:#e0e0e0;margin:20px}}
+h1{{color:#7ecfff}}
+.meta{{background:#222;padding:10px;border-radius:4px;margin-bottom:20px}}
+table{{border-collapse:collapse;width:100%}}
+th{{background:#2a3a4a;padding:6px 12px;text-align:left}}
+td{{padding:4px 12px;border-bottom:1px solid #333}}
+.reg td:last-child{{color:#ff6b6b}}
+.imp td:last-child{{color:#6bff8a}}
+.add td:last-child{{color:#6baaff}}
+.rem td:last-child{{color:#aaa}}
+</style></head>
+<body>
+<h1>puppet-trace diff</h1>
+<div class="meta">
+<b>{esc(os.path.basename(dir1))}</b> -&gt; <b>{esc(os.path.basename(dir2))}</b><br>
+Wall time: {wall1}s -&gt; {wall2}s{esc(wall_delta)}<br>
+Resources: {len(res1)} -&gt; {len(res2)} ({len(added)} added, {len(removed)} removed)
+</div>
+<table>
+<thead><tr><th>Resource</th><th>Before</th><th>After</th><th>Delta</th></tr></thead>
+<tbody>{''.join(rows) if rows else '<tr><td colspan=4 style="color:#888">No significant changes found.</td></tr>'}</tbody>
+</table>
+</body></html>"""
+    if outfile:
+        open(outfile, 'w').write(page)
+        print(f'[puppet-trace diff] HTML written to {outfile}')
+    else:
+        print(page)
+DIFF_PYEOF
+}
+
+###############################################################################
+# Prometheus textfile emitter (once mode)
+###############################################################################
+emit_prometheus_textfile() {
+    [[ -z "${PROMETHEUS_TEXTFILE:-}" ]] && return 0
+    _validate_safe_path "$PROMETHEUS_TEXTFILE" "--prometheus-textfile" || return 1
+
+    python3 - "$IO_CORR_JSON" "$OUTDIR/run-meta.json" "$PROMETHEUS_TEXTFILE" \
+        "${OUTDIR##*/}" <<'PROM_PYEOF'
+import json, os, sys, time, re
+
+io_corr_path, meta_path, outpath, run_id = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+
+resources = []
+if os.path.exists(io_corr_path):
+    try:
+        resources = json.load(open(io_corr_path))
+    except Exception:
+        pass
+
+meta = {}
+if os.path.exists(meta_path):
+    try:
+        meta = json.load(open(meta_path))
+    except Exception:
+        pass
+
+lines = []
+ts_ms = int(time.time() * 1000)
+run_label = f'run="{run_id}"'
+
+# Run-level metrics
+lines.append(f'# HELP puppet_trace_run_wall_seconds Total wall clock seconds for puppet run')
+lines.append(f'# TYPE puppet_trace_run_wall_seconds gauge')
+lines.append(f'puppet_trace_run_wall_seconds{{{run_label}}} {meta.get("wall_seconds", 0)} {ts_ms}')
+
+lines.append(f'# HELP puppet_trace_run_exit_code Puppet agent exit code (0=success)')
+lines.append(f'# TYPE puppet_trace_run_exit_code gauge')
+lines.append(f'puppet_trace_run_exit_code{{{run_label}}} {meta.get("puppet_exit", -1)} {ts_ms}')
+
+# Resource-level metrics
+lines.append(f'# HELP puppet_trace_resource_duration_seconds Per-resource wall time in seconds')
+lines.append(f'# TYPE puppet_trace_resource_duration_seconds gauge')
+lines.append(f'# HELP puppet_trace_resource_disk_bytes_written Per-resource disk bytes written')
+lines.append(f'# TYPE puppet_trace_resource_disk_bytes_written gauge')
+lines.append(f'# HELP puppet_trace_resource_disk_bytes_read Per-resource disk bytes read')
+lines.append(f'# TYPE puppet_trace_resource_disk_bytes_read gauge')
+lines.append(f'# HELP puppet_trace_resource_strace_events Per-resource strace event count')
+lines.append(f'# TYPE puppet_trace_resource_strace_events gauge')
+
+for r in resources[:200]:  # cap at 200 resources to bound metric count
+    title = r.get('resource', r.get('title', 'unknown'))
+    safe_title = re.sub(r'[^a-zA-Z0-9_]', '_', str(title))[:128]
+    label = f'{run_label},resource="{safe_title}"'
+    dur = float(r.get('t_end', 0) - r.get('t_start', 0)) if r.get('t_end') and r.get('t_start') else float(r.get('duration_s', 0))
+    dbw = int(r.get('disk_bytes_written', 0) or 0)
+    dbr = int(r.get('disk_bytes_read', 0) or 0)
+    sevt = int(r.get('strace_events', 0) or 0)
+    lines.append(f'puppet_trace_resource_duration_seconds{{{label}}} {dur:.4f} {ts_ms}')
+    lines.append(f'puppet_trace_resource_disk_bytes_written{{{label}}} {dbw} {ts_ms}')
+    lines.append(f'puppet_trace_resource_disk_bytes_read{{{label}}} {dbr} {ts_ms}')
+    lines.append(f'puppet_trace_resource_strace_events{{{label}}} {sevt} {ts_ms}')
+
+# Write atomically
+tmp = outpath + '.tmp'
+try:
+    with open(tmp, 'w') as f:
+        f.write('\n'.join(lines) + '\n')
+    os.replace(tmp, outpath)
+    print(f'[puppet-trace] Prometheus textfile written: {outpath} ({len(lines)} lines)')
+except Exception as e:
+    print(f'[puppet-trace] WARNING: could not write Prometheus textfile: {e}', file=sys.stderr)
+PROM_PYEOF
+}
+
+###############################################################################
+# puppet-trace-server integration
+###############################################################################
+toggle_server_profiling() {
+    local action="$1"   # enable or disable
+    local server="$2"   # host:port
+    [[ -z "$server" ]] && return 0
+    local url="http://${server}/api/profiling/${action}"
+    local result
+    result=$(curl -sf -X POST "$url" --max-time 5 2>/dev/null) || {
+        echo "[puppet-trace] WARNING: could not ${action} profiling on $server" >&2
+        return 0
+    }
+    echo "[puppet-trace] profiling ${action}d on $server: $result"
+}
+
+push_report_to_server() {
+    local server="$1"
+    [[ -z "$server" ]] && return 0
+    local certname
+    certname=$(puppet config print certname 2>/dev/null || hostname -f)
+    local runid
+    runid=$(basename "$OUTDIR")
+    local base_url="http://${server}/reports/${certname}/${runid}"
+    local token="${PT_UPLOAD_TOKEN:-}"
+    local headers=()
+    [[ -n "$token" ]] && headers+=(-H "X-PT-Token: $token")
+
+    local pushed=0
+    for f in "$OUTDIR/report.html" "$OUTDIR/run-meta.json" "$OUTDIR/io-correlation.json" \
+              "$OUTDIR/resource-report.json" \
+              "$OUTDIR/flamegraph.svg" "$OUTDIR/flamegraph-profile.svg"; do
+        [[ -f "$f" ]] || continue
+        local fname
+        fname=$(basename "$f")
+        if curl -sf -X PUT "${headers[@]}" \
+            --data-binary "@$f" \
+            --max-time 30 \
+            "${base_url}/${fname}" >/dev/null 2>&1; then
+            echo "[puppet-trace] pushed $fname → $base_url/$fname"
+            (( pushed++ )) || true
+        else
+            echo "[puppet-trace] WARNING: failed to push $fname to $server" >&2
+        fi
+    done
+    [[ $pushed -gt 0 ]] && echo "[puppet-trace] report available at http://${server}/reports/${certname}/${runid}/report.html"
 }
 
 ###############################################################################
@@ -3276,12 +4859,573 @@ cmd_ship() {
     $include_strace && exclude_args=()
 
     echo "[puppet-trace ship] $outdir → $remote (${exclude_args[*]:-no exclusions})"
-    rsync -av --progress --chmod=D0700,F0600 "${exclude_args[@]}" "${rsync_extra[@]}" "$outdir/" "${remote}/"
+    rsync -av --progress --chmod=D0755,F0644 "${exclude_args[@]}" "${rsync_extra[@]}" "$outdir/" "${remote}/"
     echo "[puppet-trace ship] synced — running report on $remote_host..."
     # shellcheck disable=SC2029  # printf %q is intentional — quotes path for remote shell
     ssh -o BatchMode=yes -o ConnectTimeout=30 -o StrictHostKeyChecking=yes "$remote_host" \
         "puppet-trace report -- $(printf '%q' "$remote_path")"
     echo "[puppet-trace ship] done — report at $remote_host:${remote_path}/report.html"
+}
+
+###############################################################################
+# SUBCOMMAND: demo — generate self-contained demo report with mock data
+###############################################################################
+cmd_demo() {
+    local DEMO_OUTDIR="" DEMO_FLAMEGRAPH_SVG=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --outdir)     DEMO_OUTDIR="$2"; shift 2 ;;
+            --flamegraph) DEMO_FLAMEGRAPH_SVG="$2"; shift 2 ;;
+            --help|-h) echo "Usage: puppet-trace demo [--outdir DIR] [--flamegraph SVG]"; exit 0 ;;
+            *) echo "[puppet-trace demo] unknown arg: $1" >&2; exit 1 ;;
+        esac
+    done
+
+    if [[ -z "$DEMO_OUTDIR" ]]; then
+        DEMO_OUTDIR=$(mktemp -d /tmp/puppet-trace-demo-XXXXX)
+    else
+        mkdir -p "$DEMO_OUTDIR"
+    fi
+
+    echo "[puppet-trace demo] generating mock artifacts in $DEMO_OUTDIR ..."
+
+    python3 - "$DEMO_OUTDIR" <<'DEMO_PYEOF'
+import html, json, os, sys, math, random
+
+random.seed(42)
+outdir = sys.argv[1]
+
+BASE_TS = 1748095200  # 2026-05-24T14:00:00Z
+
+# ---------------------------------------------------------------------------
+# 1. run-meta.json
+# ---------------------------------------------------------------------------
+run_meta = {
+    "wall_seconds": 47,
+    "puppet_exit": 0,
+    "puppet_cmd": "puppet agent --test",
+    "idempotency_pass": "true",
+    "idempotency_changes": 0,
+    "run_start_iso": "2026-05-24T14:00:00Z",
+    "timestamp": "20260524-140000",
+}
+with open(os.path.join(outdir, "run-meta.json"), "w") as f:
+    json.dump(run_meta, f, indent=2)
+
+# ---------------------------------------------------------------------------
+# 2. resource-report.json  (parsed format — list of resource dicts)
+# ---------------------------------------------------------------------------
+resources_raw = [
+    # (title, type, status, eval_time)
+    ("File[/etc/ssh/sshd_config]",           "File",    "changed",   0.12),
+    ("Service[sshd]",                         "Service", "changed",   0.95),
+    ("File[/etc/motd]",                       "File",    "changed",   0.03),
+    ("File[/etc/sysctl.d/99-custom.conf]",    "File",    "changed",   0.03),
+    ("File[/etc/nginx/nginx.conf]",           "File",    "changed",   0.08),
+    ("File[/etc/rsyslog.conf]",               "File",    "changed",   0.06),
+    ("Package[nginx]",                        "Package", "changed",   2.34),
+    ("Package[vim]",                          "Package", "changed",   1.87),
+    ("Package[docker-ce]",                    "Package", "changed",   4.87),
+    ("Package[curl]",                         "Package", "unchanged", 0.02),
+    ("Package[wget]",                         "Package", "unchanged", 0.02),
+    ("Package[git]",                          "Package", "unchanged", 0.02),
+    ("Service[nginx]",                        "Service", "changed",   0.45),
+    ("File[/etc/nginx/sites-enabled/default]","File",    "unchanged", 0.05),
+    ("User[deploy]",                          "User",    "changed",   0.14),
+    ("Exec[sysctl -p]",                       "Exec",    "changed",   0.22),
+    ("Service[docker]",                       "Service", "changed",   0.67),
+    ("File[/etc/docker/daemon.json]",         "File",    "changed",   0.06),
+    ("Package[chrony]",                       "Package", "unchanged", 0.02),
+    ("Service[chronyd]",                      "Service", "unchanged", 0.38),
+    ("File[/etc/audit/audit.rules]",          "File",    "failed",    0.07),
+]
+
+rr_list = []
+for title, rtype, status, eval_time in resources_raw:
+    rr_list.append({
+        "title":           title,
+        "type":            rtype,
+        "status":          status,
+        "evaluation_time": eval_time,
+        "changed":         status == "changed",
+        "failed":          status == "failed",
+        "skipped":         False,
+        "out_of_sync":     status in ("changed", "failed"),
+        "before":          None,
+        "after":           None,
+        "parameters":      {"ensure": "present" if rtype == "Package" else "file"},
+    })
+
+n_changed   = sum(1 for _,_,s,_ in resources_raw if s == "changed")
+n_unchanged = sum(1 for _,_,s,_ in resources_raw if s == "unchanged")
+n_failed    = sum(1 for _,_,s,_ in resources_raw if s == "failed")
+
+resource_report = {
+    "resources":       rr_list,
+    "totals":          {"resources.total": len(resources_raw),
+                        "resources.changed": n_changed,
+                        "resources.unchanged": n_unchanged,
+                        "resources.failed": n_failed},
+    "config_version":  "1748095200",
+    "puppet_version":  "8.7.0",
+    "transaction_uuid":"a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+    "status":          "changed",
+    "noop":            False,
+    "certname":        "puppet-node-01.example.com",
+    "summary":         {},
+}
+with open(os.path.join(outdir, "resource-report.json"), "w") as f:
+    json.dump(resource_report, f, indent=2)
+
+# ---------------------------------------------------------------------------
+# 3. io-correlation.json  (mirrors RESOURCES list from fixture generator)
+# ---------------------------------------------------------------------------
+def rss_at(t):
+    base = 88576
+    if 4  <= t <= 6:  base += int(8000 * (t-4)/2)
+    elif t > 6:        base += 8000
+    if 9  <= t <= 11: base += int(6000 * (t-9)/2)
+    elif t > 11:       base += 6000
+    if 12 <= t <= 17: base += int(20000 * (t-12)/5)
+    elif t > 17:       base += 20000
+    if t > 25:         base -= int(5000 * (t-25)/10)
+    return max(base, 85000)
+
+IO_RESOURCES = [
+    ("File[/etc/ssh/sshd_config]",          "File",    "changed",   0.12,  0.0,  0,         0,
+     ["/etc/ssh/sshd_config"], [],
+     []),
+    ("Service[sshd]",                        "Service", "changed",   0.95,  0.18, 0,         0,
+     [], [],
+     [{"exe": "/usr/bin/systemctl", "args": ["systemctl", "restart", "sshd"]}]),
+    ("File[/etc/motd]",                      "File",    "changed",   0.03,  0.14, 524288,    0,
+     ["/etc/motd"], [], []),
+    ("Package[nginx]",                       "Package", "changed",   2.34,  1.20, 52428800,  10485760,
+     [], ["/var/cache/apt/archives/nginx_1.24_amd64.deb"],
+     [{"exe": "/usr/bin/apt-get", "args": ["apt-get", "-y", "install", "nginx"]}]),
+    ("File[/etc/nginx/nginx.conf]",          "File",    "changed",   0.08,  5.98, 5242880,   4096,
+     ["/etc/nginx/nginx.conf"], ["/etc/nginx/nginx.conf.puppet_tmp"], []),
+    ("Service[nginx]",                       "Service", "changed",   0.45,  5.52, 0,         0,
+     [], [],
+     [{"exe": "/usr/bin/systemctl", "args": ["systemctl", "enable", "--now", "nginx"]}]),
+    ("User[deploy]",                         "User",    "changed",   0.14,  6.13, 0,         0,
+     [], [],
+     [{"exe": "/usr/sbin/useradd", "args": ["useradd", "-m", "deploy"]}]),
+    ("File[/etc/sysctl.d/99-custom.conf]",   "File",    "changed",   0.03,  6.65, 524288,    0,
+     ["/etc/sysctl.d/99-custom.conf"], [], []),
+    ("Exec[sysctl -p]",                      "Exec",    "changed",   0.22,  6.42, 0,         0,
+     [], [],
+     [{"exe": "/sbin/sysctl", "args": ["sysctl", "-p"]}]),
+    ("File[/etc/rsyslog.conf]",              "File",    "changed",   0.06, 10.55, 5242880,   0,
+     ["/etc/rsyslog.conf"], [], []),
+    ("Package[vim]",                         "Package", "changed",   1.87,  3.64, 52428800,  10485760,
+     [], ["/var/cache/apt/archives/vim_9.0_amd64.deb"],
+     [{"exe": "/usr/bin/apt-get", "args": ["apt-get", "-y", "install", "vim"]}]),
+    ("Package[docker-ce]",                   "Package", "changed",   4.87, 12.44, 209715200, 102400000,
+     [], ["/var/cache/apt/archives/docker-ce_24.0_amd64.deb"],
+     [{"exe": "/usr/bin/apt-get", "args": ["apt-get", "-y", "install", "docker-ce"]}]),
+    ("Service[docker]",                      "Service", "changed",   0.67, 17.32, 0,         0,
+     [], [],
+     [{"exe": "/usr/bin/systemctl", "args": ["systemctl", "enable", "--now", "docker"]}]),
+    ("File[/etc/docker/daemon.json]",        "File",    "changed",   0.06, 17.99, 512,       0,
+     ["/etc/docker/daemon.json"], [], []),
+    ("File[/etc/audit/audit.rules]",         "File",    "failed",    0.07, 18.82, 2048,      0,
+     ["/etc/audit/audit.rules"], [], []),
+]
+
+io_corr = []
+for title, rtype, status, dur, t_off, dw, dr, fw_paths, fr_paths, procs in IO_RESOURCES:
+    t0 = BASE_TS + t_off
+    t1 = t0 + dur
+    rss0 = rss_at(t_off)
+    rss1 = rss_at(t_off + dur)
+    rss_peak = max(rss_at(t_off + dur * frac) for frac in [0, 0.25, 0.5, 0.75, 1.0])
+    fw = [{"path": p, "bytes": dw // max(len(fw_paths), 1), "ops": 1} for p in fw_paths]
+    fr = [{"path": p, "bytes": dr // max(len(fr_paths), 1), "ops": 1} for p in fr_paths]
+    io_corr.append({
+        "title": title,
+        "type": rtype,
+        "status": status,
+        "duration_s": dur,
+        "t_start": t0,
+        "t_end": t1,
+        "disk_bytes_written": dw,
+        "disk_bytes_read": dr,
+        "rss_start_kb": rss0,
+        "rss_end_kb": rss1,
+        "rss_peak_kb": rss_peak,
+        "strace_events": max(2, int(dur * 15)),
+        "files_written": fw,
+        "files_read": fr,
+        "network_connections": [],
+        "processes": [{"exe": p["exe"], "args": p["args"]} for p in procs],
+        "changed": status == "changed",
+        "failed": status == "failed",
+        "skipped": False,
+        "evaluation_time": dur,
+    })
+with open(os.path.join(outdir, "io-correlation.json"), "w") as f:
+    json.dump(io_corr, f, indent=2)
+
+# ---------------------------------------------------------------------------
+# 4. proc-poll.log  (50 lines, 1/s)
+# ---------------------------------------------------------------------------
+proc_lines = []
+base_rss = 27000
+for i in range(50):
+    ts = BASE_TS + i
+    elapsed = i
+    if i < 15:
+        rss = base_rss + int((90000 - base_rss) * i / 15)
+    else:
+        rss = 90000 + random.randint(-500, 500)
+    vmpeak = int(rss * 1.10)
+    vmswap = 0
+    cpu_ticks = i * 85 + random.randint(0, 10)
+    proc_lines.append(f"{ts} {elapsed} {rss} {vmpeak} {vmswap} {cpu_ticks}")
+with open(os.path.join(outdir, "proc-poll.log"), "w") as f:
+    f.write("\n".join(proc_lines) + "\n")
+
+# ---------------------------------------------------------------------------
+# 5. proc-io-poll.log  (100 lines, every 0.5s)
+# ---------------------------------------------------------------------------
+def sigmoidal(x, center, width, total):
+    return total / (1 + math.exp(-(x - center) / width))
+
+io_lines = []
+for i in range(100):
+    ts_ms = int((BASE_TS + i * 0.5) * 1000)
+    t = i * 0.5
+    # Two write spikes: around t=14s and t=22s
+    w1 = sigmoidal(t, 14.0, 1.5, 120 * 1024 * 1024)
+    w2 = sigmoidal(t, 22.0, 1.5, 130 * 1024 * 1024)
+    write_bytes = int(w1 + w2)
+    read_bytes  = int(sigmoidal(t, 18.0, 3.0, 50 * 1024 * 1024))
+    io_lines.append(f"{ts_ms} {read_bytes} {write_bytes}")
+with open(os.path.join(outdir, "proc-io-poll.log"), "w") as f:
+    f.write("\n".join(io_lines) + "\n")
+
+# ---------------------------------------------------------------------------
+# 6. net-poll.log  (10 timestamp blocks)
+# ---------------------------------------------------------------------------
+# C000020A = 192.0.2.10 big-endian hex
+# 7F000001 = 127.0.0.1
+# Ports: 0035=53, 01BB=443, 21BC=8636, 1FC4=8132 (puppetserver=8140=1FCC, puppetdb=8081=1F91)
+net_blocks = []
+for blk in range(10):
+    ts = BASE_TS + blk * 5
+    lines = [f"# ts={ts}"]
+    # DNS always present
+    lines.append("0100007F:0035 0A")
+    # Puppet server
+    lines.append("C000020A:1FCC 06")
+    if 3 <= blk <= 6:
+        # Package install phase: apt mirrors
+        lines.append("C000020A:01BB 06")
+        lines.append("C000020A:0050 06")
+        if blk == 4 or blk == 5:
+            lines.append("0A000201:01BB 06")
+            lines.append("0A000201:0050 06")
+    else:
+        # PuppetDB
+        lines.append("C000020A:1F91 06")
+    net_blocks.append("\n".join(lines))
+with open(os.path.join(outdir, "net-poll.log"), "w") as f:
+    f.write("\n".join(net_blocks) + "\n")
+
+# ---------------------------------------------------------------------------
+# 7. pmap-{start,mid,end}.txt
+# ---------------------------------------------------------------------------
+PMAP_HEADER = "         Address       Kbytes     RSS   Dirty Mode  Mapping"
+
+def pmap_lines(base_rss_kb, extra_libs=None):
+    lines = [PMAP_HEADER]
+    # fixed mappings
+    entries = [
+        ("00400000",  4096,   int(base_rss_kb * 0.15), 0,    "r-xp", "/usr/bin/ruby3.2"),
+        ("00600000",   512,   int(base_rss_kb * 0.01), 512,  "rw-p", "/usr/bin/ruby3.2"),
+        ("7f0000000", 8192,   int(base_rss_kb * 0.05), 2048, "r-xp", "/lib/x86_64-linux-gnu/libc.so.6"),
+        ("7f0001000",  512,   int(base_rss_kb * 0.01), 256,  "rw-p", "/lib/x86_64-linux-gnu/libc.so.6"),
+        ("7f0002000", 4096,   int(base_rss_kb * 0.04), 1024, "r-xp", "/lib/x86_64-linux-gnu/libssl.so.3"),
+        ("7f0003000", 2048,   int(base_rss_kb * 0.03), 512,  "r-xp", "/lib/x86_64-linux-gnu/libpuppet.so"),
+        ("7f1000000", 40960, int(base_rss_kb * 0.45), 38000,"rw-p", "[heap]"),
+        ("7ffe00000", 8192,  int(base_rss_kb * 0.08), 4096, "rw-p", "[stack]"),
+        ("7fff00000",    4,     4,                    0,    "r--p", "[vvar]"),
+        ("7fff10000",    8,     8,                    0,    "r-xp", "[vdso]"),
+    ]
+    if extra_libs:
+        entries.extend(extra_libs)
+    for addr, kb, rss, dirty, mode, mapping in entries:
+        lines.append(f"{addr:>18}  {kb:>8}  {rss:>6}  {dirty:>6} {mode}  {mapping}")
+    return "\n".join(lines) + "\n"
+
+extra_mid = [
+    ("7f0010000", 2048, 1800, 512, "r-xp", "/usr/lib/puppet/lib/puppet/provider.so"),
+    ("7f0020000", 1024,  900, 256, "r-xp", "/usr/lib/ruby/3.2/x86_64-linux/json.so"),
+    ("7f0030000",  512,  400, 128, "r-xp", "/usr/lib/ruby/3.2/x86_64-linux/openssl.so"),
+]
+
+with open(os.path.join(outdir, "pmap-start.txt"), "w") as f:
+    f.write(pmap_lines(80000))
+with open(os.path.join(outdir, "pmap-mid.txt"), "w") as f:
+    f.write(pmap_lines(120000, extra_mid))
+with open(os.path.join(outdir, "pmap-end.txt"), "w") as f:
+    f.write(pmap_lines(90000))
+
+# ---------------------------------------------------------------------------
+# 8. puppet.log
+# ---------------------------------------------------------------------------
+puppet_log_lines = [
+    "2026-05-24T14:00:00.000Z Notice: Compiled catalog for puppet-node-01.example.com in environment production in 1.80 seconds",
+    "2026-05-24T14:00:00.001Z Info: Starting catalog run",
+    "2026-05-24T14:00:00.100Z Debug: Applying configuration version '1748095200'",
+    "2026-05-24T14:00:00.120Z Notice: /Stage[main]/Main/File[/etc/ssh/sshd_config]/content: content changed '{md5}abc123' to '{md5}def456'",
+    "2026-05-24T14:00:00.140Z Info: /Stage[main]/Main/File[/etc/motd]/ensure: defined content as '{md5}fedcba'",
+    "2026-05-24T14:00:00.180Z Notice: /Stage[main]/Main/Service[sshd]/ensure: ensure changed 'stopped' to 'running'",
+    "2026-05-24T14:00:01.200Z Info: Retrieving pluginfacts",
+    "2026-05-24T14:00:01.340Z Debug: Evaltrace: Starting to evaluate resource Package[nginx]",
+    "2026-05-24T14:00:01.350Z Info: /Stage[main]/Main/Package[nginx]/ensure: ensure changed 'absent' to 'present'",
+    "2026-05-24T14:00:03.540Z Debug: Evaltrace: Evaluated Package[nginx] in 2.340 seconds",
+    "2026-05-24T14:00:03.550Z Info: Retrieving plugin files",
+    "2026-05-24T14:00:03.640Z Debug: Evaltrace: Starting to evaluate resource Package[vim]",
+    "2026-05-24T14:00:03.650Z Info: /Stage[main]/Main/Package[vim]/ensure: ensure changed 'absent' to 'present'",
+    "2026-05-24T14:00:05.520Z Debug: Evaltrace: Evaluated Package[vim] in 1.870 seconds",
+    "2026-05-24T14:00:05.520Z Notice: /Stage[main]/Main/Service[nginx]/ensure: ensure changed 'stopped' to 'running'",
+    "2026-05-24T14:00:05.980Z Notice: /Stage[main]/Main/File[/etc/nginx/nginx.conf]/content: content changed",
+    "2026-05-24T14:00:06.070Z Info: /Stage[main]/Main/File[/etc/nginx/sites-enabled/default]/ensure: ensure is symlink",
+    "2026-05-24T14:00:06.130Z Notice: /Stage[main]/Main/User[deploy]/ensure: created",
+    "2026-05-24T14:00:06.420Z Notice: /Stage[main]/Main/Exec[sysctl -p]/returns: executed successfully",
+    "2026-05-24T14:00:06.650Z Info: /Stage[main]/Main/File[/etc/sysctl.d/99-custom.conf]/content: content changed",
+    "2026-05-24T14:00:10.550Z Notice: /Stage[main]/Main/File[/etc/rsyslog.conf]/content: content changed",
+    "2026-05-24T14:00:12.440Z Debug: Evaltrace: Starting to evaluate resource Package[docker-ce]",
+    "2026-05-24T14:00:12.450Z Info: /Stage[main]/Main/Package[docker-ce]/ensure: ensure changed 'absent' to 'present'",
+    "2026-05-24T14:00:17.310Z Debug: Evaltrace: Evaluated Package[docker-ce] in 4.870 seconds",
+    "2026-05-24T14:00:17.320Z Notice: /Stage[main]/Main/Service[docker]/ensure: ensure changed 'stopped' to 'running'",
+    "2026-05-24T14:00:17.990Z Info: /Stage[main]/Main/File[/etc/docker/daemon.json]/ensure: defined content",
+    "2026-05-24T14:00:18.060Z Info: /Stage[main]/Main/Package[chrony]/ensure: chrony is already installed",
+    "2026-05-24T14:00:18.140Z Info: /Stage[main]/Main/Service[chronyd]/ensure: service is already running",
+    "2026-05-24T14:00:18.820Z Warning: Deprecation notice: The 'mode' parameter as an integer is deprecated; use a string like '0640' instead (file: manifests/files.pp, line: 47)",
+    "2026-05-24T14:00:18.820Z Debug: Evaltrace: Starting to evaluate resource File[/etc/audit/audit.rules]",
+    "2026-05-24T14:00:18.827Z Error: Could not evaluate: Could not retrieve information for /etc/audit/audit.rules: Permission denied - /etc/audit/audit.rules",
+    "2026-05-24T14:00:18.890Z Info: /Stage[main]/Main/Service[auditd]/ensure: service is already running",
+    "2026-05-24T14:00:47.230Z Notice: Applied catalog in 47.23 seconds",
+    "2026-05-24T14:00:47.231Z Info: Caching catalog for puppet-node-01.example.com",
+    "2026-05-24T14:00:47.235Z Info: Creating state file /opt/puppetlabs/puppet/cache/state/state.yaml",
+]
+with open(os.path.join(outdir, "puppet.log"), "w") as f:
+    f.write("\n".join(puppet_log_lines) + "\n")
+
+# ---------------------------------------------------------------------------
+# 9. idempotency.stdout
+# ---------------------------------------------------------------------------
+idempotency_lines = [
+    "2026-05-24T14:01:00.000Z Notice: Compiled catalog for puppet-node-01.example.com in environment production in 1.72 seconds",
+    "2026-05-24T14:01:00.001Z Info: Starting catalog run",
+    "2026-05-24T14:01:00.010Z Info: Applying configuration version '1748095200'",
+    "2026-05-24T14:01:01.800Z Info: /Stage[main]/Main/File[/etc/audit/audit.rules]: Could not evaluate (skipped in noop)",
+    "2026-05-24T14:01:09.230Z Notice: Applied catalog in 9.23 seconds",
+    "2026-05-24T14:01:09.231Z Notice: Finished catalog run; 0 resources changed, 0 events triggered.",
+]
+with open(os.path.join(outdir, "idempotency.stdout"), "w") as f:
+    f.write("\n".join(idempotency_lines) + "\n")
+
+# ---------------------------------------------------------------------------
+# 10. sysctx-before.txt and sysctx-after.txt
+# ---------------------------------------------------------------------------
+def sysctx(mem_free_kb, label):
+    mem_total = 16384000
+    mem_available = mem_free_kb + 2048000
+    cached = 3145728
+    return (
+        f"# {label}\n"
+        f"MemTotal:       {mem_total} kB\n"
+        f"MemFree:        {mem_free_kb} kB\n"
+        f"MemAvailable:   {mem_available} kB\n"
+        f"Cached:         {cached} kB\n"
+        f"Filesystem      1K-blocks    Used Available Use% Mounted on\n"
+        f"/dev/sda1       102400000 41234567  61165433  40% /\n"
+        f"/dev/sdb1       51200000  18874368  32325632  37% /var\n"
+    )
+
+with open(os.path.join(outdir, "sysctx-before.txt"), "w") as f:
+    f.write(sysctx(8192000, "before"))
+with open(os.path.join(outdir, "sysctx-after.txt"), "w") as f:
+    f.write(sysctx(7864320, "after"))
+
+# ---------------------------------------------------------------------------
+# 11. flamegraph.svg  (synthetic perf flamegraph)
+# ---------------------------------------------------------------------------
+# Try flamegraph.pl first
+import subprocess, shutil, tempfile
+
+fg_pl = shutil.which("flamegraph.pl") or shutil.which("flamegraph") or None
+for c in ["/home/rune/src/runecorps/vendor/flamegraph/flamegraph.pl"]:
+    if not fg_pl and os.path.isfile(c):
+        fg_pl = c
+
+def write_flamegraph_svg(path, folded_stacks, title="Flamegraph", width=1200, height=400):
+    if fg_pl:
+        try:
+            proc = subprocess.run(
+                ["perl", fg_pl, "--title", title, f"--width={width}", f"--height={height}",
+                 "--colors=hot", "--countname=samples"],
+                input=folded_stacks, capture_output=True, text=True, timeout=15
+            )
+            if proc.returncode == 0 and proc.stdout.strip():
+                with open(path, "w") as f:
+                    f.write(proc.stdout)
+                return
+        except Exception:
+            pass
+    # Fallback: hand-crafted SVG
+    frames = [
+        # (label, x_pct, w_pct, level, color)
+        ("ruby; main",                               0,  100, 0, "#e85"),
+        ("Puppet::Agent#run",                        0,   90, 1, "#e65"),
+        ("Puppet::Resource::Catalog#compile",        0,   70, 2, "#e45"),
+        ("Puppet::Parser::Compiler#compile",         0,   50, 3, "#d55"),
+        ("Puppet::Type::Package#sync",              50,   20, 2, "#c84"),
+        ("Puppet::Type::File#sync",                 70,   15, 2, "#b94"),
+        ("do_syscall_64",                           85,   10, 2, "#86a"),
+        ("openat",                                  85,    5, 3, "#76a"),
+        ("read",                                    90,    5, 3, "#66b"),
+        ("write",                                   85,    3, 4, "#56b"),
+        ("Puppet::Util::Log#create",                 0,   10, 1, "#c74"),
+        ("GC.compact",                              90,   10, 1, "#a84"),
+    ]
+    fh = 15
+    svg_h = (max(f[3] for f in frames) + 2) * fh + 80
+    parts = [
+        f'<?xml version="1.0" encoding="UTF-8"?>',
+        f'<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">',
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{svg_h}" onload="init(evt)" version="1.1">',
+        f'<defs><linearGradient id="background" y1="0" y2="1" x1="0" x2="0">'
+        f'<stop stop-color="#eeeeee" offset="5%"/><stop stop-color="#eeeeb0" offset="95%"/>'
+        f'</linearGradient></defs>',
+        f'<style type="text/css">text {{font-family:Verdana;font-size:12px;fill:rgb(0,0,0);}}</style>',
+        f'<rect x="0.0" y="0" width="{width}" height="{svg_h}" fill="url(#background)" />',
+        f'<text x="{width//2}" y="24" text-anchor="middle" font-size="17">{html.escape(title)}</text>',
+    ]
+    y_base = svg_h - fh - 2
+    for label, x_pct, w_pct, level, color in frames:
+        x = int(width * x_pct / 100)
+        w = max(1, int(width * w_pct / 100) - 1)
+        y = y_base - level * fh
+        parts.append(
+            f'<g><title>{html.escape(label)}</title>'
+            f'<rect x="{x}" y="{y}" width="{w}" height="{fh-1}" fill="{color}" rx="1"/>'
+            f'<text x="{x+3}" y="{y+fh-3}" font-size="11">{html.escape(label[:max(1,w//7)])}</text>'
+            f'</g>'
+        )
+    parts.append('</svg>')
+    with open(path, "w") as f:
+        f.write("\n".join(parts) + "\n")
+
+perf_folded = """\
+ruby;[unknown];Puppet::Agent#run;Puppet::Resource::Catalog#compile;Puppet::Parser::Compiler#compile;rb_funcall 8200
+ruby;[unknown];Puppet::Agent#run;Puppet::Resource::Catalog#compile;Puppet::Parser::Compiler#compile;rb_eval_string 4100
+ruby;[unknown];Puppet::Agent#run;Puppet::Resource::Catalog#compile;Puppet::Type::Package#sync;rb_funcall;do_syscall_64;entry_SYSCALL_64_after_hwframe;do_syscall_64;__x64_sys_execve;bprm_execve 3200
+ruby;[unknown];Puppet::Agent#run;Puppet::Resource::Catalog#compile;Puppet::Type::Package#sync;rb_funcall;do_syscall_64;entry_SYSCALL_64_after_hwframe;do_syscall_64;__x64_sys_write;ksys_write;vfs_write 2100
+ruby;[unknown];Puppet::Agent#run;Puppet::Resource::Catalog#compile;Puppet::Type::File#sync;rb_funcall;do_syscall_64;entry_SYSCALL_64_after_hwframe;__x64_sys_openat;do_filp_open;path_openat 1800
+ruby;[unknown];Puppet::Agent#run;Puppet::Resource::Catalog#compile;Puppet::Type::File#sync;rb_funcall;do_syscall_64;entry_SYSCALL_64_after_hwframe;__x64_sys_read;ksys_read;vfs_read 1400
+ruby;[unknown];Puppet::Agent#run;Puppet::Resource::Catalog#compile;Puppet::Parser::Compiler#compile;rb_eval_string;rb_load;rb_require_safe 1200
+ruby;[unknown];Puppet::Agent#run;Puppet::Resource::Catalog#compile;Puppet::Parser::Compiler#compile;rb_eval_string;rb_load;rb_require_safe;rb_funcall 900
+ruby;[unknown];Puppet::Agent#run;Puppet::Resource::Catalog#compile;Puppet::Type::Service#sync;rb_funcall;do_syscall_64;entry_SYSCALL_64_after_hwframe;__x64_sys_write 800
+ruby;[unknown];Puppet::Agent#run;Puppet::Resource::Catalog#compile;Puppet::Type::Package#sync;rb_funcall;do_syscall_64;entry_SYSCALL_64_after_hwframe;__x64_sys_waitid;do_wait;do_waitpid 760
+ruby;[unknown];Puppet::Agent#run;Puppet::Resource::Catalog#compile;Puppet::Parser::Compiler#compile;rb_funcall;rb_hash_lookup2 650
+ruby;[unknown];Puppet::Agent#run;Puppet::Resource::Catalog#compile;Puppet::Parser::Compiler#compile;rb_eval_string;rb_funcall;rb_ary_each 580
+ruby;[unknown];Puppet::Agent#run;Puppet::Resource::Catalog#compile;Puppet::Type::Exec#sync;rb_funcall;do_syscall_64;entry_SYSCALL_64_after_hwframe;__x64_sys_execve 520
+ruby;[unknown];Puppet::Agent#run;Puppet::Resource::Catalog#compile;Puppet::Type::Package#sync;rb_funcall;do_syscall_64;entry_SYSCALL_64_after_hwframe;__x64_sys_read 480
+ruby;[unknown];Puppet::Agent#run;Puppet::Util::Log#create;rb_funcall 420
+ruby;[unknown];Puppet::Agent#run;Puppet::Resource::Catalog#compile;Puppet::Type::File#sync;rb_funcall;do_syscall_64;entry_SYSCALL_64_after_hwframe;__x64_sys_fstat64 380
+ruby;[unknown];Puppet::Agent#run;GC.compact;rb_gc_mark;rb_mark_hash 340
+ruby;[unknown];Puppet::Agent#run;Puppet::Resource::Catalog#compile;Puppet::Parser::Compiler#compile;rb_funcall;rb_str_new 300
+ruby;[unknown];Puppet::Agent#run;Puppet::Resource::Catalog#compile;Puppet::Type::Package#sync;rb_funcall;do_syscall_64;entry_SYSCALL_64_after_hwframe;__x64_sys_openat 280
+ruby;[unknown];Puppet::Agent#run;Puppet::Resource::Catalog#compile;Puppet::Type::File#sync;rb_funcall;rb_io_write 240
+ruby;[unknown];Puppet::Agent#run;GC.compact;rb_gc_mark;rb_mark_tbl_no_pin 210
+ruby;[unknown];Puppet::Agent#run;Puppet::Resource::Catalog#compile;Puppet::Parser::Compiler#compile;rb_funcall;rb_obj_alloc 180
+ruby;[unknown];Puppet::Agent#run;Puppet::Resource::Catalog#compile;Puppet::Type::Package#sync;rb_funcall;do_syscall_64;entry_SYSCALL_64_after_hwframe;__x64_sys_write;ksys_write;ext4_file_write_iter 160
+ruby;[unknown];Puppet::Agent#run;Puppet::Resource::Catalog#compile;Puppet::Type::Package#sync;rb_funcall;do_syscall_64;entry_SYSCALL_64_after_hwframe;__x64_sys_read;ksys_read;ext4_file_read_iter 140
+ruby;[unknown];Puppet::Agent#run;Puppet::Resource::Catalog#compile;Puppet::Parser::Compiler#compile;rb_funcall;rb_hash_foreach 120
+ruby;[unknown];schedule;schedule_idle 100
+ruby;[unknown];Puppet::Agent#run;Puppet::Resource::Catalog#compile;Puppet::Type::Package#sync;rb_funcall;do_syscall_64;entry_SYSCALL_64_after_hwframe;__x64_sys_nanosleep 90
+ruby;[unknown];Puppet::Agent#run;Puppet::Resource::Catalog#compile;Puppet::Type::File#sync;rb_funcall;do_syscall_64;entry_SYSCALL_64_after_hwframe;__x64_sys_lstat64 80
+"""
+write_flamegraph_svg(os.path.join(outdir, "flamegraph.svg"), perf_folded,
+                     title="puppet-trace perf flamegraph (demo)", width=1200, height=400)
+
+# ---------------------------------------------------------------------------
+# 12. flamegraph-profile.svg  (catalog compilation profile)
+# ---------------------------------------------------------------------------
+profile_folded = """\
+Puppet::Resource::Catalog#compile;Puppet::Parser::Compiler#compile;Puppet::Module#find_manifests;Puppet::Module#match_manifests 18500
+Puppet::Resource::Catalog#compile;Puppet::Parser::Compiler#compile;Puppet::Module#find_manifests;Puppet::FileSystem#glob 9200
+Puppet::Resource::Catalog#compile;Puppet::Parser::Compiler#compile;Puppet::Parser::AST::Resource;Puppet::Resource::new 7400
+Puppet::Resource::Catalog#compile;Puppet::Parser::Compiler#compile;Puppet::Parser::AST::Resource;Puppet::Type#[]= 5100
+Puppet::Resource::Catalog#compile;Puppet::Parser::Compiler#compile;Puppet::Module#load_class;Puppet::Parser::Files.find_manifests_in_modules 4800
+Puppet::Resource::Catalog#compile;Puppet::Parser::Compiler#compile;Puppet::Type#check_value;Puppet::Pops::Types::TypeParser#interpret 4200
+Puppet::Resource::Catalog#compile;Puppet::Resource::Catalog#apply;Puppet::Transaction#evaluate;Puppet::Type::Package#sync 3900
+Puppet::Resource::Catalog#compile;Puppet::Resource::Catalog#apply;Puppet::Transaction#evaluate;Puppet::Type::File#sync 3100
+Puppet::Resource::Catalog#compile;Puppet::Parser::Compiler#compile;Puppet::Module#load_class;Puppet::Parser::AST::ASTArray 2700
+Puppet::Resource::Catalog#compile;Puppet::Resource::Catalog#apply;Puppet::Transaction#evaluate;Puppet::Type::Service#sync 2300
+Puppet::Resource::Catalog#compile;Puppet::Parser::Compiler#compile;Puppet::Parser::AST::Resource;Puppet::Resource::Catalog#add_resource 1900
+Puppet::Resource::Catalog#compile;Puppet::Parser::Compiler#compile;Puppet::Type#check_value;Puppet::Pops::Types::TypeCalculator#assignable? 1600
+Puppet::Resource::Catalog#compile;Puppet::Resource::Catalog#apply;Puppet::Transaction#evaluate;Puppet::Type::Exec#sync 1400
+Puppet::Resource::Catalog#compile;Puppet::Parser::Compiler#compile;Puppet::Module#find_manifests;Dir#glob 1200
+Puppet::Resource::Catalog#compile;Puppet::Resource::Catalog#apply;Puppet::Transaction#evaluate;Puppet::Transaction::ResourceHarness#evaluate 1100
+Puppet::Resource::Catalog#compile;Puppet::Parser::Compiler#compile;Puppet::Module#load_class;Puppet::Parser::Lexer#scan 950
+Puppet::Resource::Catalog#compile;Puppet::Resource::Catalog#apply;Puppet::Transaction#evaluate;Puppet::Transaction::ResourceHarness#perform_changes 820
+Puppet::Resource::Catalog#compile;Puppet::Parser::Compiler#compile;Puppet::Parser::AST::Resource;Puppet::Resource::Catalog#relationship_graph 700
+Puppet::Resource::Catalog#compile;Puppet::Resource::Catalog#apply;Puppet::Transaction#report;Puppet::Transaction::Report#add_resource_status 580
+Puppet::Resource::Catalog#compile;Puppet::Parser::Compiler#compile;Puppet::Type#check_value;Puppet::Pops::Evaluator::EvaluatorImpl#evaluate 460
+Puppet::Resource::Catalog#compile;Puppet::Resource::Catalog#apply;Puppet::Transaction#evaluate;Puppet::Type::User#sync 380
+Puppet::Resource::Catalog#compile;Puppet::Parser::Compiler#compile;Puppet::Module#load_class;Puppet::Parser::AST::Hostclass#evaluate_code 320
+Puppet::Resource::Catalog#compile;Puppet::Resource::Catalog#apply;Puppet::Transaction#finish 260
+Puppet::Resource::Catalog#compile;Puppet::Resource::Catalog#apply;Puppet::Transaction#evaluate;Puppet::Type::Package#ensure_installed 210
+"""
+write_flamegraph_svg(os.path.join(outdir, "flamegraph-profile.svg"), profile_folded,
+                     title="Puppet Catalog Compilation (demo)", width=1200, height=300)
+
+print(f"[puppet-trace demo] generated {len(os.listdir(outdir))} artifact files in {outdir}")
+DEMO_PYEOF
+
+    # Optionally overlay a real flamegraph SVG
+    if [[ -n "${DEMO_FLAMEGRAPH_SVG:-}" && -s "$DEMO_FLAMEGRAPH_SVG" ]]; then
+        cp "$DEMO_FLAMEGRAPH_SVG" "$DEMO_OUTDIR/flamegraph.svg"
+        echo "[puppet-trace demo] using flamegraph: $DEMO_FLAMEGRAPH_SVG"
+    fi
+
+    # Set all path variables generate_report expects
+    OUTDIR="$DEMO_OUTDIR"
+    PUPPET_LOG="$DEMO_OUTDIR/puppet.log"
+    PROC_LOG="$DEMO_OUTDIR/proc-poll.log"
+    NET_LOG="$DEMO_OUTDIR/net-poll.log"
+    STRACE_LOG="$DEMO_OUTDIR/strace.log"
+    INOTIFY_LOG="$DEMO_OUTDIR/inotify.log"
+    FLAMEGRAPH_SVG="$DEMO_OUTDIR/flamegraph.svg"
+    PROFILE_FLAMEGRAPH_SVG="$DEMO_OUTDIR/flamegraph-profile.svg"
+    PROFILE_LOG="$DEMO_OUTDIR/puppetserver-profile.log"
+    STRACE_RAW="$DEMO_OUTDIR/strace.raw"
+    IO_CORR_JSON="$DEMO_OUTDIR/io-correlation.json"
+    IDEMPOTENCY_STDOUT="$DEMO_OUTDIR/idempotency.stdout"
+    REPORT_HTML="$DEMO_OUTDIR/report.html"
+
+    # Load meta from generated run-meta.json
+    local meta="$DEMO_OUTDIR/run-meta.json"
+    WALL_SECONDS=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(int(d.get('wall_seconds',0)))" "$meta" 2>/dev/null || echo 47)
+    PUPPET_EXIT=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(int(d.get('puppet_exit',0)))" "$meta" 2>/dev/null || echo 0)
+    PUPPET_CMD_META=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('puppet_cmd','puppet agent --test'))" "$meta" 2>/dev/null || echo "puppet agent --test")
+    IDEMPOTENCY_PASS=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('idempotency_pass','true'))" "$meta" 2>/dev/null || echo "true")
+    IDEMPOTENCY_CHANGES=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(int(d.get('idempotency_changes',0)))" "$meta" 2>/dev/null || echo 0)
+    RUN_START_ISO=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('run_start_iso',''))" "$meta" 2>/dev/null || echo "")
+    read -r -a PUPPET_CMD <<< "$PUPPET_CMD_META"
+
+    echo "[puppet-trace demo] generating HTML report..."
+    generate_report
+
+    echo ""
+    echo "[puppet-trace demo] report: $DEMO_OUTDIR/report.html"
+    echo "[puppet-trace demo] outdir: $DEMO_OUTDIR"
 }
 
 ###############################################################################
@@ -3305,7 +5449,9 @@ echo "[puppet-trace] command: ${PUPPET_CMD[*]}"
 if $DRY_RUN; then
     generate_fixture_data
 else
+    toggle_server_profiling enable "$PROFILING_SERVER"
     run_puppet
+    toggle_server_profiling disable "$PROFILING_SERVER"
 fi
 
 generate_flamegraph
@@ -3328,7 +5474,9 @@ if ! $DRY_RUN; then
 fi
 
 save_run_meta || true
+emit_prometheus_textfile || true
 generate_report
+push_report_to_server "$PUSH_SERVER" || true
 
 # Summary stats from correlation
 STRACE_EVENTS=0
